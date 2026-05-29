@@ -42,6 +42,8 @@ cl /nologo /W4 /O2 /DAPI_ONLY my_app.c src\Client.c
 
 `Client.exe` is only a small sanity-check tool. Your own application should link against `Client.c` directly.
 
+Full API documentation is available in [docs/API.md](docs/API.md).
+
 ## Support
 
 * x64 UEFI firmware with AMI Aptio V style PI SMM support
