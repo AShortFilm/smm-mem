@@ -7,6 +7,8 @@
 
 SmmMem allows a normal usermode application to read, write, translate, and resolve Windows memory through an SMM handler running in ring -2. The client side does not require a custom kernel driver. Usermode talks to ACPI WMI, ACPI rings a software SMI, and the SMM driver handles the memory request.
 
+https://github.com/user-attachments/assets/08513a12-0f89-47c3-982a-565fa84a9a5b
+
 The project consists of two firmware components: `Dxe.efi` for the ACPI WMI doorbell and mailbox setup, and `Smm.efi` for the actual memory API running inside SMM.
 
 ## API
