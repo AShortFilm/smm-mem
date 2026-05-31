@@ -43,9 +43,13 @@ static EFI_PHYSICAL_ADDRESS gMailboxPhysical;
 static EFI_EVENT gRetryTimerEvent;
 static EFI_EVENT gReadyToBootEvent;
 static EFI_EVENT gSmmCommEvent;
+static EFI_EVENT gAcpiEvent;
 static VOID *gSmmCommRegistration;
+static VOID *gAcpiRegistration;
 static UINT32 gConfigured;
 static UINT32 gConfigureAttempts;
+static UINT32 gWmiInstalled;
+static UINT32 gWmiAttempts;
 static CONFIG gPublishedConfig;
 static UINT8 gSsdt[512];
 
@@ -375,27 +379,48 @@ static EFI_STATUS InstallWmi(VOID) {
   EFI_STATUS Status;
   UINTN TableKey;
   UINTN TableSize;
+  UINT32 Attempt;
+  BOOLEAN LogIt;
 
+  if (gWmiInstalled != 0) {
+    return EFI_SUCCESS;
+  }
+  Attempt = ++gWmiAttempts;
+  LogIt = (Attempt <= 3);
+  if (LogIt) {
+    Log("dxe install wmi attempt=0x");
+    LogHex(Attempt);
+    Log("\n");
+  }
   Status = gSystemTable->BootServices->LocateProtocol(
       &gEfiAcpiTableProtocolGuid, 0, (VOID **)&AcpiTable);
   if (EFI_ERROR(Status) || AcpiTable == 0) {
-    LogStatus("dxe acpi protocol failed ",
-              EFI_ERROR(Status) ? Status : EFI_NOT_FOUND);
+    if (LogIt) {
+      LogStatus("dxe acpi protocol unavailable ",
+                EFI_ERROR(Status) ? Status : EFI_NOT_FOUND);
+    }
     return EFI_ERROR(Status) ? Status : EFI_NOT_FOUND;
   }
   TableSize = BuildSsdt(gSsdt, sizeof(gSsdt));
   if (TableSize == 0) {
-    Log("dxe ssdt build failed\n");
+    if (LogIt) {
+      Log("dxe ssdt build failed\n");
+    }
     return EFI_OUT_OF_RESOURCES;
   }
-  Log("dxe ssdt size=0x");
-  LogHex(TableSize);
-  Log("\n");
+  if (LogIt) {
+    Log("dxe ssdt size=0x");
+    LogHex(TableSize);
+    Log("\n");
+  }
   Status = AcpiTable->InstallAcpiTable(AcpiTable, gSsdt, TableSize,
                                        &TableKey);
   if (EFI_ERROR(Status)) {
-    LogStatus("dxe ssdt install failed ", Status);
+    if (LogIt) {
+      LogStatus("dxe ssdt install failed ", Status);
+    }
   } else {
+    gWmiInstalled = 1;
     Log("dxe ssdt installed\n");
   }
   return Status;
@@ -578,35 +603,43 @@ static EFI_STATUS ConfigureSmm(VOID) {
   return Status;
 }
 
-static VOID EFIAPI RetryConfigureSmm(EFI_EVENT Event, VOID *Context) {
-  EFI_STATUS Status;
+static VOID EFIAPI RetrySetup(EFI_EVENT Event, VOID *Context) {
+  EFI_STATUS WmiStatus;
+  EFI_STATUS SmmStatus;
   (void)Event;
   (void)Context;
 
-  if (gConfigured != 0) {
+  if (gWmiInstalled != 0 && gConfigured != 0) {
     return;
   }
-  Status = ConfigureSmm();
-  if (!EFI_ERROR(Status) && gRetryTimerEvent != 0) {
-    Status = gSystemTable->BootServices->SetTimer(gRetryTimerEvent,
-                                                  TimerCancel, 0);
-    if (EFI_ERROR(Status)) {
-      LogStatus("dxe retry timer cancel failed ", Status);
+  WmiStatus = EFI_SUCCESS;
+  SmmStatus = EFI_SUCCESS;
+  if (gWmiInstalled == 0) {
+    WmiStatus = InstallWmi();
+  }
+  if (gConfigured == 0) {
+    SmmStatus = ConfigureSmm();
+  }
+  if (!EFI_ERROR(WmiStatus) && !EFI_ERROR(SmmStatus) &&
+      gRetryTimerEvent != 0) {
+    SmmStatus = gSystemTable->BootServices->SetTimer(gRetryTimerEvent,
+                                                     TimerCancel, 0);
+    if (EFI_ERROR(SmmStatus)) {
+      LogStatus("dxe retry timer cancel failed ", SmmStatus);
     } else {
       Log("dxe retry timer canceled\n");
     }
-    (void)Status;
   }
 }
 
 static VOID RegisterRetryTimer(VOID) {
   EFI_STATUS Status;
 
-  if (gRetryTimerEvent != 0 || gConfigured != 0) {
+  if (gRetryTimerEvent != 0 || (gWmiInstalled != 0 && gConfigured != 0)) {
     return;
   }
   Status = gSystemTable->BootServices->CreateEvent(
-      EVT_TIMER | EVT_NOTIFY_SIGNAL, TPL_CALLBACK, RetryConfigureSmm, 0,
+      EVT_TIMER | EVT_NOTIFY_SIGNAL, TPL_CALLBACK, RetrySetup, 0,
       &gRetryTimerEvent);
   if (EFI_ERROR(Status)) {
     gRetryTimerEvent = 0;
@@ -631,8 +664,7 @@ static VOID RegisterSmmCommNotify(VOID) {
     return;
   }
   Status = gSystemTable->BootServices->CreateEvent(
-      EVT_NOTIFY_SIGNAL, TPL_CALLBACK, RetryConfigureSmm, 0,
-      &gSmmCommEvent);
+      EVT_NOTIFY_SIGNAL, TPL_CALLBACK, RetrySetup, 0, &gSmmCommEvent);
   if (EFI_ERROR(Status)) {
     gSmmCommEvent = 0;
     LogStatus("dxe smm communication notify create failed ", Status);
@@ -650,10 +682,34 @@ static VOID RegisterSmmCommNotify(VOID) {
   }
 }
 
+static VOID RegisterAcpiNotify(VOID) {
+  EFI_STATUS Status;
+
+  if (gAcpiEvent != 0 || gWmiInstalled != 0) {
+    return;
+  }
+  Status = gSystemTable->BootServices->CreateEvent(
+      EVT_NOTIFY_SIGNAL, TPL_CALLBACK, RetrySetup, 0, &gAcpiEvent);
+  if (EFI_ERROR(Status)) {
+    gAcpiEvent = 0;
+    LogStatus("dxe acpi notify create failed ", Status);
+    return;
+  }
+  Status = gSystemTable->BootServices->RegisterProtocolNotify(
+      &gEfiAcpiTableProtocolGuid, gAcpiEvent, &gAcpiRegistration);
+  if (EFI_ERROR(Status)) {
+    gSystemTable->BootServices->CloseEvent(gAcpiEvent);
+    gAcpiEvent = 0;
+    LogStatus("dxe acpi notify failed ", Status);
+  } else {
+    Log("dxe acpi notify registered\n");
+  }
+}
+
 static VOID RegisterReadyToBootRetry(VOID) {
   EFI_STATUS Status;
 
-  if (gReadyToBootEvent != 0 || gConfigured != 0 ||
+  if (gReadyToBootEvent != 0 || (gWmiInstalled != 0 && gConfigured != 0) ||
       gSystemTable->BootServices->CreateEventEx == 0) {
     if (gSystemTable->BootServices->CreateEventEx == 0) {
       Log("dxe ready retry unavailable\n");
@@ -661,7 +717,7 @@ static VOID RegisterReadyToBootRetry(VOID) {
     return;
   }
   Status = gSystemTable->BootServices->CreateEventEx(
-      EVT_NOTIFY_SIGNAL, TPL_CALLBACK, RetryConfigureSmm, 0,
+      EVT_NOTIFY_SIGNAL, TPL_CALLBACK, RetrySetup, 0,
       &gEfiEventReadyToBootGuid, &gReadyToBootEvent);
   if (EFI_ERROR(Status)) {
     gReadyToBootEvent = 0;
@@ -702,10 +758,11 @@ EFI_STATUS EFIAPI DxeEntry(EFI_HANDLE ImageHandle,
     LogStatus("dxe wmi install failed ", Status);
   }
   Status = ConfigureSmm();
-  if (EFI_ERROR(Status)) {
+  if (gWmiInstalled == 0 || gConfigured == 0) {
     RegisterRetryTimer();
     RegisterReadyToBootRetry();
     RegisterSmmCommNotify();
+    RegisterAcpiNotify();
   }
   Log("mem dxe done\n");
   return EFI_SUCCESS;
