@@ -3,7 +3,10 @@
 
 #pragma intrinsic(__inbyte)
 #pragma intrinsic(__outbyte)
+#pragma intrinsic(__readcr0)
+#pragma intrinsic(__writecr0)
 #pragma intrinsic(__readcr3)
+#pragma intrinsic(__writecr3)
 #pragma intrinsic(__readmsr)
 #pragma intrinsic(__cpuidex)
 #pragma function(memset)
@@ -13,8 +16,14 @@
 #define PAGE_MASK 0xFFFFFFFFFFFFF000ULL
 #define LARGE_PAGE_SIZE 0x200000ULL
 #define LARGE_PAGE_MASK 0xFFFFFFFFFFE00000ULL
+#define HUGE_PAGE_SIZE 0x40000000ULL
+#define HUGE_PAGE_MASK 0xFFFFFFFFC0000000ULL
+#define HIGH_PHYS_BASE 0x100000000ULL
 #define PTE_PRESENT 1ULL
+#define PTE_RW 2ULL
 #define PTE_LARGE (1ULL << 7)
+#define PAGE_TABLE_FLAGS (PTE_PRESENT | PTE_RW)
+#define CR0_WP (1ULL << 16)
 #define MSR_LSTAR 0xC0000082U
 #define SAVE_STATE_CR3 53U
 
@@ -29,6 +38,9 @@ typedef EFI_STATUS(EFIAPI *WRITE_SAVE_STATE)(const EFI_SMM_CPU_PROTOCOL *This,
 typedef EFI_STATUS(EFIAPI *SMM_CPU_IO)(const EFI_SMM_CPU_IO2_PROTOCOL *This,
                                        UINT32 Width, UINT64 Address,
                                        UINTN Count, VOID *Buffer);
+typedef EFI_STATUS(EFIAPI *SMM_ALLOCATE_PAGES)(EFI_ALLOCATE_TYPE Type,
+                                               UINT32 MemoryType, UINTN Pages,
+                                               EFI_PHYSICAL_ADDRESS *Memory);
 
 struct EFI_SMM_CPU_PROTOCOL {
   READ_SAVE_STATE ReadSaveState;
@@ -59,6 +71,11 @@ static UINT32 gNameOffset;
 static UINT32 gPebOffset;
 static UINT32 gCr3Offset;
 static UINT64 gPhysMask;
+static UINT32 gMapReady;
+static UINT64 gMapWindow;
+static UINT64 gMapPdpt;
+static UINT32 gFastRangeCount;
+static UINT64 gFastRanges[32];
 
 static VOID CopyMemLocal(VOID *Destination, const VOID *Source, UINTN Size) {
   UINT8 *Dst = (UINT8 *)Destination;
@@ -73,6 +90,15 @@ static VOID ZeroMem(VOID *Buffer, UINTN Size) {
   while (Size--) {
     *Ptr++ = 0;
   }
+}
+
+static VOID WritePtEntryNoWp(volatile UINT64 *Entry, UINT64 Value) {
+  UINT64 Cr0;
+
+  Cr0 = __readcr0();
+  __writecr0(Cr0 & ~CR0_WP);
+  *Entry = Value;
+  __writecr0(Cr0);
 }
 
 VOID *memset(VOID *Destination, int Value, size_t Size) {
@@ -189,10 +215,198 @@ static BOOLEAN IsUserPtr(UINT64 Value) {
   return Value >= 0x10000ULL && Value < 0x0000800000000000ULL;
 }
 
+static UINT64 PhysMask(VOID);
+
+static BOOLEAN IsHighPhysicalCopy(UINT64 Address, UINTN Size) {
+  if (Size == 0) {
+    return 0;
+  }
+  return Address >= HIGH_PHYS_BASE ||
+         Address + Size - 1ULL >= HIGH_PHYS_BASE;
+}
+
+static BOOLEAN HasFastRange(UINT64 Address) {
+  UINT64 Range;
+  UINT32 Index;
+
+  Range = Address & HUGE_PAGE_MASK;
+  for (Index = 0; Index < gFastRangeCount; Index++) {
+    if (gFastRanges[Index] == Range) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static VOID RememberFastRange(UINT64 Address) {
+  if (HasFastRange(Address)) {
+    return;
+  }
+  if (gFastRangeCount < sizeof(gFastRanges) / sizeof(gFastRanges[0])) {
+    gFastRanges[gFastRangeCount++] = Address & HUGE_PAGE_MASK;
+  }
+}
+
+static EFI_STATUS CheckSmmMapping(UINT64 Address) {
+  volatile UINT64 *EntryPtr;
+  UINT64 Entry;
+  UINT64 Base;
+  UINT64 Mask;
+
+  Mask = PhysMask();
+  Base = __readcr3() & PAGE_MASK & Mask;
+  EntryPtr = (volatile UINT64 *)(UINTN)(
+      Base + (((Address >> 39) & 0x1FFULL) * sizeof(UINT64)));
+  Entry = *EntryPtr;
+  if ((Entry & PTE_PRESENT) == 0) {
+    return EFI_NOT_FOUND;
+  }
+  Base = Entry & Mask;
+  EntryPtr = (volatile UINT64 *)(UINTN)(
+      Base + (((Address >> 30) & 0x1FFULL) * sizeof(UINT64)));
+  Entry = *EntryPtr;
+  if ((Entry & PTE_PRESENT) == 0) {
+    return EFI_NOT_FOUND;
+  }
+  if ((Entry & PTE_LARGE) != 0) {
+    return EFI_SUCCESS;
+  }
+  Base = Entry & Mask;
+  EntryPtr = (volatile UINT64 *)(UINTN)(
+      Base + (((Address >> 21) & 0x1FFULL) * sizeof(UINT64)));
+  Entry = *EntryPtr;
+  if ((Entry & PTE_PRESENT) == 0) {
+    return EFI_NOT_FOUND;
+  }
+  if ((Entry & PTE_LARGE) != 0) {
+    return EFI_SUCCESS;
+  }
+  Base = Entry & Mask;
+  EntryPtr = (volatile UINT64 *)(UINTN)(
+      Base + (((Address >> 12) & 0x1FFULL) * sizeof(UINT64)));
+  Entry = *EntryPtr;
+  return (Entry & PTE_PRESENT) != 0 ? EFI_SUCCESS : EFI_NOT_FOUND;
+}
+
+static EFI_STATUS InitMapWindow(VOID) {
+  SMM_ALLOCATE_PAGES AllocatePages;
+  volatile UINT64 *Pml4;
+  EFI_PHYSICAL_ADDRESS Memory;
+  EFI_STATUS Status;
+  UINT64 Cr3;
+  UINT64 Mask;
+  UINTN Index;
+
+  if (gMapReady != 0) {
+    return EFI_SUCCESS;
+  }
+  if (gSmst == 0 || gSmst->SmmAllocatePages == 0) {
+    return EFI_UNSUPPORTED;
+  }
+  Cr3 = __readcr3() & PAGE_MASK;
+  Mask = PhysMask();
+  Pml4 = (volatile UINT64 *)(UINTN)(Cr3 & Mask);
+  for (Index = 1; Index < 256; Index++) {
+    if ((Pml4[Index] & PTE_PRESENT) == 0) {
+      break;
+    }
+  }
+  if (Index == 256) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+  AllocatePages = (SMM_ALLOCATE_PAGES)gSmst->SmmAllocatePages;
+  Memory = 0xFFFFFFFFULL;
+  Status = AllocatePages(AllocateMaxAddress, EFI_RUNTIME_SERVICES_DATA, 1,
+                         &Memory);
+  if (EFI_ERROR(Status)) {
+    return Status;
+  }
+  ZeroMem((VOID *)(UINTN)Memory, (UINTN)PAGE_SIZE);
+  gMapPdpt = Memory;
+  gMapWindow = ((UINT64)Index) << 39;
+  WritePtEntryNoWp(&Pml4[Index], (gMapPdpt & Mask) | PAGE_TABLE_FLAGS);
+  __writecr3(__readcr3());
+  gMapReady = 1;
+  return EFI_SUCCESS;
+}
+
+static EFI_STATUS MapWindowHuge(UINT64 Address) {
+  EFI_STATUS Status;
+  UINT64 Entry;
+
+  Status = InitMapWindow();
+  if (EFI_ERROR(Status)) {
+    return Status;
+  }
+  Entry = (Address & HUGE_PAGE_MASK & PhysMask()) |
+          PAGE_TABLE_FLAGS | PTE_LARGE;
+  WritePtEntryNoWp(&((volatile UINT64 *)(UINTN)gMapPdpt)[0], Entry);
+  __writecr3(__readcr3());
+  return EFI_SUCCESS;
+}
+
+static EFI_STATUS CopyPhysWindow(UINT64 Address, VOID *Buffer, UINTN Size,
+                                 BOOLEAN Write) {
+  volatile UINT8 *Window;
+  UINT8 *Bytes;
+  EFI_STATUS Status;
+  UINTN Chunk;
+  UINTN Index;
+  UINT64 Offset;
+
+  Bytes = (UINT8 *)Buffer;
+  while (Size != 0) {
+    Offset = Address & (HUGE_PAGE_SIZE - 1ULL);
+    Chunk = (UINTN)(HUGE_PAGE_SIZE - Offset);
+    if (Chunk > Size) {
+      Chunk = Size;
+    }
+    Status = MapWindowHuge(Address);
+    if (EFI_ERROR(Status)) {
+      return Status;
+    }
+    Window = (volatile UINT8 *)(UINTN)(gMapWindow + Offset);
+    for (Index = 0; Index < Chunk; Index++) {
+      if (Write) {
+        Window[Index] = Bytes[Index];
+      } else {
+        Bytes[Index] = Window[Index];
+      }
+    }
+    Address += Chunk;
+    Bytes += Chunk;
+    Size -= Chunk;
+  }
+  return EFI_SUCCESS;
+}
+
+static BOOLEAN CanUseSmmIo(UINT64 Address, UINTN Size) {
+  UINTN Chunk;
+
+  while (Size != 0) {
+    Chunk = (UINTN)(HUGE_PAGE_SIZE - (Address & (HUGE_PAGE_SIZE - 1ULL)));
+    if (Chunk > Size) {
+      Chunk = Size;
+    }
+    if (Address >= HIGH_PHYS_BASE && !HasFastRange(Address)) {
+      if (EFI_ERROR(CheckSmmMapping(Address))) {
+        return 0;
+      }
+      RememberFastRange(Address);
+    }
+    Address += Chunk;
+    Size -= Chunk;
+  }
+  return 1;
+}
+
 static EFI_STATUS CopyPhys(UINT64 Address, VOID *Buffer, UINTN Size,
                            BOOLEAN Write) {
   SMM_CPU_IO Access;
 
+  if (IsHighPhysicalCopy(Address, Size) && !CanUseSmmIo(Address, Size)) {
+    return CopyPhysWindow(Address, Buffer, Size, Write);
+  }
   Access = (SMM_CPU_IO)(Write ? gSmst->SmmIo.Mem.Write
                               : gSmst->SmmIo.Mem.Read);
   return Access(&gSmst->SmmIo, 0, Address, Size, Buffer);
@@ -200,23 +414,31 @@ static EFI_STATUS CopyPhys(UINT64 Address, VOID *Buffer, UINTN Size,
 
 static UINT64 PhysMask(VOID) {
   int Regs[4];
+  UINT32 MaxLeaf;
   UINT32 PhysBits;
   UINT32 CBit;
 
   if (gPhysMask != 0) {
     return gPhysMask;
   }
-  __cpuidex(Regs, 0x80000008, 0);
-  PhysBits = (UINT32)(Regs[0] & 0xFF);
+  __cpuidex(Regs, 0x80000000, 0);
+  MaxLeaf = (UINT32)Regs[0];
+  PhysBits = 52;
+  if (MaxLeaf >= 0x80000008U) {
+    __cpuidex(Regs, 0x80000008, 0);
+    PhysBits = (UINT32)(Regs[0] & 0xFF);
+  }
   if (PhysBits == 0 || PhysBits > 52) {
     PhysBits = 52;
   }
   gPhysMask = ((1ULL << PhysBits) - 1ULL) & PAGE_MASK;
-  __cpuidex(Regs, 0x8000001F, 0);
-  if ((Regs[0] & 1) != 0) {
-    CBit = (UINT32)(Regs[1] & 0x3F);
-    if (CBit < 63) {
-      gPhysMask &= ~(1ULL << CBit);
+  if (MaxLeaf >= 0x8000001FU) {
+    __cpuidex(Regs, 0x8000001F, 0);
+    if ((Regs[0] & 1) != 0) {
+      CBit = (UINT32)(Regs[1] & 0x3F);
+      if (CBit < 63) {
+        gPhysMask &= ~(1ULL << CBit);
+      }
     }
   }
   return gPhysMask;
