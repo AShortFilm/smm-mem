@@ -207,6 +207,22 @@ static BOOLEAN SameName(const char *A, const char *B) {
   return *A == 0 && *B == 0;
 }
 
+static const char *BaseName(const char *Path) {
+  const char *Name = Path;
+
+  while (*Path != 0) {
+    if (*Path == '\\' || *Path == '/') {
+      Name = Path + 1;
+    }
+    Path++;
+  }
+  return Name;
+}
+
+static BOOLEAN SameBaseName(const char *Path, const char *Name) {
+  return SameName(BaseName(Path), Name);
+}
+
 static BOOLEAN IsKernelPtr(UINT64 Value) {
   return Value >= 0xFFFF800000000000ULL;
 }
@@ -876,9 +892,24 @@ static EFI_STATUS FindImageBase(UINT64 Eprocess, UINT64 Cr3, UINT64 *Base) {
   return EFI_NOT_FOUND;
 }
 
+static EFI_STATUS ReadProcessImagePath(UINT64 Eprocess, UINT64 Cr3, char *Out,
+                                       UINTN OutSize) {
+  UINT64 Peb;
+  UINT64 Params;
+
+  if (FindPeb(Eprocess, Cr3, &Peb) != EFI_SUCCESS ||
+      ReadVirt64(Cr3, Peb + 0x20, &Params) != EFI_SUCCESS ||
+      !IsUserPtr(Params)) {
+    return EFI_NOT_FOUND;
+  }
+  return ReadUnicodeName(Cr3, Params + 0x60, Out, OutSize);
+}
+
 static EFI_STATUS FillProcessInfo(UINT64 Eprocess, PROCESS_INFO *Info) {
   UINT64 Pid;
   UINT64 Cr3;
+  char ImagePath[260];
+
   ZeroMem(Info, sizeof(*Info));
   if (ReadVirt64(gKernelCr3, Eprocess + gPidOffset, &Pid) != EFI_SUCCESS ||
       GetProcessCr3(Eprocess, &Cr3) != EFI_SUCCESS) {
@@ -893,6 +924,11 @@ static EFI_STATUS FillProcessInfo(UINT64 Eprocess, PROCESS_INFO *Info) {
     Info->Name[sizeof(Info->Name) - 1] = 0;
   }
   FindImageBase(Eprocess, Cr3, &Info->ImageBase);
+  ZeroMem(ImagePath, sizeof(ImagePath));
+  if (ReadProcessImagePath(Eprocess, Cr3, ImagePath, sizeof(ImagePath)) ==
+      EFI_SUCCESS) {
+    WriteText(Info->Name, sizeof(Info->Name), BaseName(ImagePath));
+  }
   return EFI_SUCCESS;
 }
 
@@ -934,6 +970,8 @@ static EFI_STATUS FindProcessName(const char *Name, PROCESS_INFO *Info) {
   UINT64 Link;
   UINT32 Guard;
   char CurrentName[NAME_SIZE];
+  char ImagePath[260];
+  UINT64 Cr3;
 
   if (ResolveProcessLayout() != EFI_SUCCESS || gNameOffset == 0) {
     return EFI_NOT_FOUND;
@@ -955,6 +993,14 @@ static EFI_STATUS FindProcessName(const char *Name, PROCESS_INFO *Info) {
                 sizeof(CurrentName) - 1, 0);
     if (SameName(CurrentName, Name)) {
       return FillProcessInfo(Eprocess, Info);
+    }
+    if (GetProcessCr3(Eprocess, &Cr3) == EFI_SUCCESS) {
+      ZeroMem(ImagePath, sizeof(ImagePath));
+      if (ReadProcessImagePath(Eprocess, Cr3, ImagePath, sizeof(ImagePath)) ==
+              EFI_SUCCESS &&
+          SameBaseName(ImagePath, Name)) {
+        return FillProcessInfo(Eprocess, Info);
+      }
     }
     if (ReadVirt64(gKernelCr3, Eprocess + gLinksOffset, &Link) !=
         EFI_SUCCESS) {
