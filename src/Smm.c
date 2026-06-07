@@ -18,7 +18,6 @@
 #define LARGE_PAGE_MASK 0xFFFFFFFFFFE00000ULL
 #define HUGE_PAGE_SIZE 0x40000000ULL
 #define HUGE_PAGE_MASK 0xFFFFFFFFC0000000ULL
-#define HIGH_PHYS_BASE 0x100000000ULL
 #define PTE_PRESENT 1ULL
 #define PTE_RW 2ULL
 #define PTE_LARGE (1ULL << 7)
@@ -35,9 +34,6 @@ typedef EFI_STATUS(EFIAPI *WRITE_SAVE_STATE)(const EFI_SMM_CPU_PROTOCOL *This,
                                              UINTN Width, UINT32 Register,
                                              UINTN CpuIndex,
                                              const VOID *Buffer);
-typedef EFI_STATUS(EFIAPI *SMM_CPU_IO)(const EFI_SMM_CPU_IO2_PROTOCOL *This,
-                                       UINT32 Width, UINT64 Address,
-                                       UINTN Count, VOID *Buffer);
 typedef EFI_STATUS(EFIAPI *SMM_ALLOCATE_PAGES)(EFI_ALLOCATE_TYPE Type,
                                                UINT32 MemoryType, UINTN Pages,
                                                EFI_PHYSICAL_ADDRESS *Memory);
@@ -74,8 +70,8 @@ static UINT64 gPhysMask;
 static UINT32 gMapReady;
 static UINT64 gMapWindow;
 static UINT64 gMapPdpt;
-static UINT32 gFastRangeCount;
-static UINT64 gFastRanges[32];
+static UINT64 gMapWindowBase;
+static UINT32 gMapWindowBaseValid;
 
 static VOID CopyMemLocal(VOID *Destination, const VOID *Source, UINTN Size) {
   UINT8 *Dst = (UINT8 *)Destination;
@@ -233,77 +229,6 @@ static BOOLEAN IsUserPtr(UINT64 Value) {
 
 static UINT64 PhysMask(VOID);
 
-static BOOLEAN IsHighPhysicalCopy(UINT64 Address, UINTN Size) {
-  if (Size == 0) {
-    return 0;
-  }
-  return Address >= HIGH_PHYS_BASE ||
-         Address + Size - 1ULL >= HIGH_PHYS_BASE;
-}
-
-static BOOLEAN HasFastRange(UINT64 Address) {
-  UINT64 Range;
-  UINT32 Index;
-
-  Range = Address & HUGE_PAGE_MASK;
-  for (Index = 0; Index < gFastRangeCount; Index++) {
-    if (gFastRanges[Index] == Range) {
-      return 1;
-    }
-  }
-  return 0;
-}
-
-static VOID RememberFastRange(UINT64 Address) {
-  if (HasFastRange(Address)) {
-    return;
-  }
-  if (gFastRangeCount < sizeof(gFastRanges) / sizeof(gFastRanges[0])) {
-    gFastRanges[gFastRangeCount++] = Address & HUGE_PAGE_MASK;
-  }
-}
-
-static EFI_STATUS CheckSmmMapping(UINT64 Address) {
-  volatile UINT64 *EntryPtr;
-  UINT64 Entry;
-  UINT64 Base;
-  UINT64 Mask;
-
-  Mask = PhysMask();
-  Base = __readcr3() & PAGE_MASK & Mask;
-  EntryPtr = (volatile UINT64 *)(UINTN)(
-      Base + (((Address >> 39) & 0x1FFULL) * sizeof(UINT64)));
-  Entry = *EntryPtr;
-  if ((Entry & PTE_PRESENT) == 0) {
-    return EFI_NOT_FOUND;
-  }
-  Base = Entry & Mask;
-  EntryPtr = (volatile UINT64 *)(UINTN)(
-      Base + (((Address >> 30) & 0x1FFULL) * sizeof(UINT64)));
-  Entry = *EntryPtr;
-  if ((Entry & PTE_PRESENT) == 0) {
-    return EFI_NOT_FOUND;
-  }
-  if ((Entry & PTE_LARGE) != 0) {
-    return EFI_SUCCESS;
-  }
-  Base = Entry & Mask;
-  EntryPtr = (volatile UINT64 *)(UINTN)(
-      Base + (((Address >> 21) & 0x1FFULL) * sizeof(UINT64)));
-  Entry = *EntryPtr;
-  if ((Entry & PTE_PRESENT) == 0) {
-    return EFI_NOT_FOUND;
-  }
-  if ((Entry & PTE_LARGE) != 0) {
-    return EFI_SUCCESS;
-  }
-  Base = Entry & Mask;
-  EntryPtr = (volatile UINT64 *)(UINTN)(
-      Base + (((Address >> 12) & 0x1FFULL) * sizeof(UINT64)));
-  Entry = *EntryPtr;
-  return (Entry & PTE_PRESENT) != 0 ? EFI_SUCCESS : EFI_NOT_FOUND;
-}
-
 static EFI_STATUS InitMapWindow(VOID) {
   SMM_ALLOCATE_PAGES AllocatePages;
   volatile UINT64 *Pml4;
@@ -339,6 +264,8 @@ static EFI_STATUS InitMapWindow(VOID) {
   }
   ZeroMem((VOID *)(UINTN)Memory, (UINTN)PAGE_SIZE);
   gMapPdpt = Memory;
+  gMapWindowBase = 0;
+  gMapWindowBaseValid = 0;
   gMapWindow = ((UINT64)Index) << 39;
   WritePtEntryNoWp(&Pml4[Index], (gMapPdpt & Mask) | PAGE_TABLE_FLAGS);
   __writecr3(__readcr3());
@@ -349,15 +276,23 @@ static EFI_STATUS InitMapWindow(VOID) {
 static EFI_STATUS MapWindowHuge(UINT64 Address) {
   EFI_STATUS Status;
   UINT64 Entry;
+  UINT64 Base;
+  UINT64 Mask;
 
   Status = InitMapWindow();
   if (EFI_ERROR(Status)) {
     return Status;
   }
-  Entry = (Address & HUGE_PAGE_MASK & PhysMask()) |
-          PAGE_TABLE_FLAGS | PTE_LARGE;
+  Mask = PhysMask();
+  Base = Address & HUGE_PAGE_MASK & Mask;
+  if (gMapWindowBaseValid != 0 && gMapWindowBase == Base) {
+    return EFI_SUCCESS;
+  }
+  Entry = Base | PAGE_TABLE_FLAGS | PTE_LARGE;
   WritePtEntryNoWp(&((volatile UINT64 *)(UINTN)gMapPdpt)[0], Entry);
   __writecr3(__readcr3());
+  gMapWindowBase = Base;
+  gMapWindowBaseValid = 1;
   return EFI_SUCCESS;
 }
 
@@ -396,36 +331,9 @@ static EFI_STATUS CopyPhysWindow(UINT64 Address, VOID *Buffer, UINTN Size,
   return EFI_SUCCESS;
 }
 
-static BOOLEAN CanUseSmmIo(UINT64 Address, UINTN Size) {
-  UINTN Chunk;
-
-  while (Size != 0) {
-    Chunk = (UINTN)(HUGE_PAGE_SIZE - (Address & (HUGE_PAGE_SIZE - 1ULL)));
-    if (Chunk > Size) {
-      Chunk = Size;
-    }
-    if (Address >= HIGH_PHYS_BASE && !HasFastRange(Address)) {
-      if (EFI_ERROR(CheckSmmMapping(Address))) {
-        return 0;
-      }
-      RememberFastRange(Address);
-    }
-    Address += Chunk;
-    Size -= Chunk;
-  }
-  return 1;
-}
-
 static EFI_STATUS CopyPhys(UINT64 Address, VOID *Buffer, UINTN Size,
                            BOOLEAN Write) {
-  SMM_CPU_IO Access;
-
-  if (IsHighPhysicalCopy(Address, Size) && !CanUseSmmIo(Address, Size)) {
-    return CopyPhysWindow(Address, Buffer, Size, Write);
-  }
-  Access = (SMM_CPU_IO)(Write ? gSmst->SmmIo.Mem.Write
-                              : gSmst->SmmIo.Mem.Read);
-  return Access(&gSmst->SmmIo, 0, Address, Size, Buffer);
+  return CopyPhysWindow(Address, Buffer, Size, Write);
 }
 
 static UINT64 PhysMask(VOID) {
