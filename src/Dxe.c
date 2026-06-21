@@ -360,16 +360,18 @@ static UINTN BuildSsdt(UINT8 *Buffer, UINTN Capacity) {
 
 static EFI_STATUS AllocateMailbox(VOID) {
   EFI_STATUS Status;
+  EFI_PHYSICAL_ADDRESS Address = 0xFFFFFFFFULL;
   UINTN Pages = (MAILBOX_SIZE + 0xFFFU) / 0x1000U;
 
   if (gMailboxPhysical != 0) {
     return EFI_SUCCESS;
   }
   Status = gSystemTable->BootServices->AllocatePages(
-      AllocateAnyPages, EFI_RUNTIME_SERVICES_DATA, Pages, &gMailboxPhysical);
+      AllocateMaxAddress, EFI_RUNTIME_SERVICES_DATA, Pages, &Address);
   if (EFI_ERROR(Status)) {
     return Status;
   }
+  gMailboxPhysical = Address;
   ZeroMem((VOID *)(UINTN)gMailboxPhysical, MAILBOX_SIZE);
   return EFI_SUCCESS;
 }

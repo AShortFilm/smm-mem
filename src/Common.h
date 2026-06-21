@@ -29,8 +29,9 @@ typedef UINT64 EFI_PHYSICAL_ADDRESS;
 #define MAILBOX_SIZE 0x2000U
 #define REQUEST_SIZE 4096U
 #define RESPONSE_OFFSET 0x1000U
-#define RESPONSE_SIZE 512U
-#define RESPONSE_DATA_SIZE 352U
+#define RESPONSE_SIZE 4096U
+#define REQUEST_DATA_SIZE 4048U
+#define RESPONSE_DATA_SIZE 4060U
 #define NAME_SIZE 64U
 
 #define CONFIG_MAGIC 0x434D4D534D4D5355ULL
@@ -48,10 +49,15 @@ typedef UINT64 EFI_PHYSICAL_ADDRESS;
 #define CMD_FIND_MODULE 9U
 #define CMD_FIND_KERNEL_MODULE 10U
 #define CMD_FIND_EXPORT 11U
+#define CMD_DIAG 12U
+#define CMD_ATTACH_RING 13U
+#define CMD_RUN_RING 14U
 
 #define STATUS_OK 0U
 #define EFI_RUNTIME_SERVICES_DATA 6U
+#ifndef SERIAL
 #define SERIAL 1U
+#endif
 #define COM1_PORT 0x3F8U
 
 typedef struct {
@@ -120,7 +126,7 @@ typedef EFI_STATUS(EFIAPI *EFI_CREATE_EVENT_EX)(UINT32 Type, EFI_TPL NotifyTpl,
                                                 EFI_EVENT *Event);
 
 #define EVT_TIMER 0x80000000U
-#define EVT_NOTIFY_SIGNAL 0x00000100U
+#define EVT_NOTIFY_SIGNAL 0x00000200U
 #define TPL_CALLBACK 8U
 
 struct EFI_BOOT_SERVICES {
@@ -251,6 +257,52 @@ typedef struct {
   UINT64 Cr3;
   char Name[NAME_SIZE];
 } MODULE_INFO;
+
+#define DIAG_MAX_CPUS 12U
+#define DIAG_MAX_PROBES 8U
+
+typedef struct {
+  UINT64 Lstar;
+  UINT64 CurrentCr3;
+  UINT64 ProbeCr3;
+  UINT64 KernelCr3;
+  UINT64 KernelBase;
+  UINT64 SystemProcess;
+  UINT64 PsLoadedModuleList;
+  UINT32 NumberOfCpus;
+  UINT32 SmmCpuPresent;
+  UINT64 SavedCr3[DIAG_MAX_CPUS];
+  UINT32 SavedStatus[DIAG_MAX_CPUS];
+  UINT64 ProbeBase[DIAG_MAX_PROBES];
+  UINT32 ProbeStatus[DIAG_MAX_PROBES];
+  UINT32 ProbeValue[DIAG_MAX_PROBES];
+  UINT32 InitKernelStatus;
+  UINT32 ListLayoutStatus;
+  UINT32 Cr3OffsetStatus;
+  UINT32 Reserved;
+} DIAG_INFO;
+
+#define RING_MAGIC 0x31474E49524D4D53ULL
+#define RING_VERSION 1U
+#define RING_OP_BENCH_READ 1U
+#define RING_MAX_PAGES 4096U
+
+typedef struct {
+  UINT64 Magic;
+  UINT32 Version;
+  UINT32 HeaderSize;
+  UINT32 Op;
+  UINT32 Status;
+  UINT64 Sequence;
+  UINT32 TargetPid;
+  UINT32 Size;
+  UINT64 TargetVa;
+  UINT64 Count;
+  UINT64 Completed;
+  UINT64 Checksum;
+  UINT64 TscStart;
+  UINT64 TscEnd;
+} RING_HEADER;
 
 typedef struct {
   UINT64 Magic;
