@@ -193,6 +193,35 @@ Returns nonzero if the full range was read successfully.
 
 The client automatically splits larger reads into small requests. The SMM side translates each page and handles ranges that cross page boundaries.
 
+## ReadVirtBatch
+
+```c
+typedef struct {
+  uint64_t Address;
+  uint32_t Size;
+  uint32_t BufferOffset;
+  uint32_t Status;
+} READV_ENTRY;
+
+int ReadVirtBatch(uint32_t Pid, READV_ENTRY *Entries, uint32_t Count,
+                  void *Buffer, uint32_t BufferSize);
+```
+
+Reads many virtual ranges from one target process through one ring request.
+
+| Argument | Meaning |
+| --- | --- |
+| `Pid` | Target process ID. |
+| `Entries` | Array of read requests. `Status` is updated per entry. |
+| `Count` | Number of entries. |
+| `Buffer` | Output buffer backing all requested ranges. |
+| `BufferSize` | Size of `Buffer`. |
+
+Each entry copies `Size` bytes from `Address` into `Buffer + BufferOffset`.
+The function uses the persistent locked ring data path and returns nonzero only
+when every entry succeeds. Individual failures are still reported in each
+entry's `Status`.
+
 ## WriteVirt
 
 ```c

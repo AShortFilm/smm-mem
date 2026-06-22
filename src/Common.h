@@ -283,9 +283,32 @@ typedef struct {
 } DIAG_INFO;
 
 #define RING_MAGIC 0x31474E49524D4D53ULL
-#define RING_VERSION 1U
+#define RING_VERSION 2U
 #define RING_OP_BENCH_READ 1U
+#define RING_OP_READV 2U
+#define RING_OP_EXEC 3U
+#define RING_FLAG_REFRESH_TARGET 0x00000001U
+#define RING_FLAG_CONTINUE_ON_ERROR 0x00000002U
 #define RING_MAX_PAGES 4096U
+#define RING_EXEC_MAX_REGS 32U
+#define RING_EXEC_MAX_OPS 8192U
+
+#define RING_EXEC_OP_MOV_IMM 1U
+#define RING_EXEC_OP_READ_U8 2U
+#define RING_EXEC_OP_READ_U16 3U
+#define RING_EXEC_OP_READ_U32 4U
+#define RING_EXEC_OP_READ_U64 5U
+#define RING_EXEC_OP_ADD 6U
+#define RING_EXEC_OP_AND 7U
+#define RING_EXEC_OP_SHR 8U
+#define RING_EXEC_OP_MUL 9U
+#define RING_EXEC_OP_OUT 10U
+#define RING_EXEC_OP_READ_OUT 11U
+#define RING_EXEC_OP_LEA 12U
+
+#define RING_EXEC_FLAG_OPTIONAL 0x00000001U
+#define RING_EXEC_FLAG_BREAK_ON_ERROR 0x00000002U
+#define RING_EXEC_FLAG_SKIP_IF_ZERO 0x00000004U
 
 typedef struct {
   UINT64 Magic;
@@ -302,7 +325,38 @@ typedef struct {
   UINT64 Checksum;
   UINT64 TscStart;
   UINT64 TscEnd;
+  UINT32 Flags;
+  UINT32 ItemSize;
+  UINT32 ItemCount;
+  UINT32 Reserved;
+  UINT64 ItemsOffset;
+  UINT64 OutputOffset;
+  UINT64 OutputSize;
+  UINT64 BytesCompleted;
+  UINT64 Faulted;
 } RING_HEADER;
+
+typedef struct {
+  UINT64 Va;
+  UINT32 Size;
+  UINT32 OutOffset;
+  UINT32 Status;
+  UINT32 Flags;
+  UINT64 Pa;
+} RING_READV_ITEM;
+
+typedef struct {
+  UINT8 Op;
+  UINT8 Dst;
+  UINT8 Src;
+  UINT8 Aux;
+  UINT32 Reserved0;
+  UINT64 Imm;
+  UINT32 Size;
+  UINT32 OutOffset;
+  UINT32 Status;
+  UINT32 Flags;
+} RING_EXEC_OP;
 
 typedef struct {
   UINT64 Magic;

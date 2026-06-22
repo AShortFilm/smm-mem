@@ -102,8 +102,15 @@ typedef struct {
 } DIAG_INFO;
 
 #define RING_MAGIC 0x31474E49524D4D53ULL
-#define RING_VERSION 1U
+#define RING_VERSION 2U
 #define RING_OP_BENCH_READ 1U
+#define RING_OP_READV 2U
+#define RING_OP_EXEC 3U
+#define RING_FLAG_REFRESH_TARGET 0x00000001U
+#define RING_FLAG_CONTINUE_ON_ERROR 0x00000002U
+#define RING_MAX_PAGES 4096U
+#define RING_MAX_SIZE ((size_t)RING_MAX_PAGES * 4096U)
+#define RING_EXEC_MAX_OPS 8192U
 
 typedef struct {
   uint64_t Magic;
@@ -120,7 +127,25 @@ typedef struct {
   uint64_t Checksum;
   uint64_t TscStart;
   uint64_t TscEnd;
+  uint32_t Flags;
+  uint32_t ItemSize;
+  uint32_t ItemCount;
+  uint32_t Reserved;
+  uint64_t ItemsOffset;
+  uint64_t OutputOffset;
+  uint64_t OutputSize;
+  uint64_t BytesCompleted;
+  uint64_t Faulted;
 } RING_HEADER;
+
+typedef struct {
+  uint64_t Va;
+  uint32_t Size;
+  uint32_t OutOffset;
+  uint32_t Status;
+  uint32_t Flags;
+  uint64_t Pa;
+} RING_READV_ITEM;
 
 static GUID gMemGuid = {
     0xa0c9f8de,
@@ -135,12 +160,28 @@ static const wchar_t *gMemInstances[] = {
     NULL};
 
 static STATE g;
+static RING_HEADER *gBatchRing;
+static size_t gBatchRingSize;
+static int gBatchRingLocked;
 
 #ifndef API_ONLY
 static int gVerbose;
 #endif
 
+static void FreeBatchRing(void) {
+  if (gBatchRing != NULL) {
+    if (gBatchRingLocked) {
+      VirtualUnlock(gBatchRing, gBatchRingSize);
+    }
+    VirtualFree(gBatchRing, 0, MEM_RELEASE);
+  }
+  gBatchRing = NULL;
+  gBatchRingSize = 0;
+  gBatchRingLocked = 0;
+}
+
 static void CloseRaw(void) {
+  FreeBatchRing();
   if (g.CloseBlock != NULL && g.Block != NULL) {
     g.CloseBlock(g.Block);
   }
@@ -504,6 +545,173 @@ static int RunRing(void) {
   return Send(Request, &Response) && Response.Status == STATUS_OK;
 }
 
+static uint64_t AlignUp64(uint64_t Value, uint64_t Alignment) {
+  return (Value + Alignment - 1ULL) & ~(Alignment - 1ULL);
+}
+
+static int EnsureBatchRing(uint64_t RequiredSize) {
+  size_t RingSize;
+
+  if (RequiredSize < 4096ULL) {
+    RequiredSize = 4096ULL;
+  }
+  RequiredSize = AlignUp64(RequiredSize, 4096ULL);
+  if (RequiredSize > RING_MAX_SIZE) {
+    return 0;
+  }
+  if (gBatchRing != NULL && gBatchRingSize >= (size_t)RequiredSize) {
+    return 1;
+  }
+
+  FreeBatchRing();
+  RingSize = (size_t)RequiredSize;
+  gBatchRing = (RING_HEADER *)VirtualAlloc(NULL, RingSize,
+                                           MEM_RESERVE | MEM_COMMIT,
+                                           PAGE_READWRITE);
+  if (gBatchRing == NULL) {
+    return 0;
+  }
+  ZeroMemory(gBatchRing, RingSize);
+  for (size_t Offset = 0; Offset < RingSize; Offset += 4096U) {
+    ((volatile uint8_t *)gBatchRing)[Offset] = 0;
+  }
+  gBatchRingLocked = VirtualLock(gBatchRing, RingSize) != 0;
+  gBatchRingSize = RingSize;
+
+  if (!AttachRing(GetCurrentProcessId(), (uint64_t)(uintptr_t)gBatchRing,
+                  (uint64_t)gBatchRingSize)) {
+    FreeBatchRing();
+    return 0;
+  }
+  return 1;
+}
+
+int ReadVirtBatch(uint32_t Pid, READV_ENTRY *Entries, uint32_t Count,
+                  void *Buffer, uint32_t BufferSize) {
+  uint64_t ItemsOffset;
+  uint64_t ItemsSize;
+  uint64_t OutputOffset;
+  uint64_t RequiredSize;
+  RING_READV_ITEM *RingItems;
+  int RingOk;
+
+  if (Pid == 0 || Entries == NULL || Count == 0 || Buffer == NULL ||
+      BufferSize == 0) {
+    return 0;
+  }
+
+  ItemsOffset = AlignUp64(sizeof(RING_HEADER), 16ULL);
+  ItemsSize = (uint64_t)Count * sizeof(RING_READV_ITEM);
+  if (ItemsSize / Count != sizeof(RING_READV_ITEM)) {
+    return 0;
+  }
+  OutputOffset = AlignUp64(ItemsOffset + ItemsSize, 16ULL);
+  RequiredSize = OutputOffset + BufferSize;
+  if (RequiredSize < OutputOffset || !EnsureBatchRing(RequiredSize)) {
+    return 0;
+  }
+
+  ZeroMemory(gBatchRing, gBatchRingSize);
+  RingItems = (RING_READV_ITEM *)((uint8_t *)gBatchRing + ItemsOffset);
+  for (uint32_t Index = 0; Index < Count; Index++) {
+    if (Entries[Index].Size == 0 ||
+        Entries[Index].BufferOffset > BufferSize ||
+        Entries[Index].Size > BufferSize - Entries[Index].BufferOffset) {
+      return 0;
+    }
+    RingItems[Index].Va = Entries[Index].Address;
+    RingItems[Index].Size = Entries[Index].Size;
+    RingItems[Index].OutOffset = Entries[Index].BufferOffset;
+    RingItems[Index].Status = 0xFFFFFFFFU;
+    RingItems[Index].Flags = 0;
+    RingItems[Index].Pa = 0;
+    Entries[Index].Status = 0xFFFFFFFFU;
+  }
+
+  gBatchRing->Magic = RING_MAGIC;
+  gBatchRing->Version = RING_VERSION;
+  gBatchRing->HeaderSize = sizeof(*gBatchRing);
+  gBatchRing->Op = RING_OP_READV;
+  gBatchRing->Status = 0xFFFFFFFFU;
+  gBatchRing->Sequence = GetTickCount64();
+  gBatchRing->TargetPid = Pid;
+  gBatchRing->Flags = RING_FLAG_CONTINUE_ON_ERROR;
+  gBatchRing->ItemSize = sizeof(RING_READV_ITEM);
+  gBatchRing->ItemCount = Count;
+  gBatchRing->ItemsOffset = ItemsOffset;
+  gBatchRing->OutputOffset = OutputOffset;
+  gBatchRing->OutputSize = BufferSize;
+
+  RingOk = RunRing();
+
+  for (uint32_t Index = 0; Index < Count; Index++) {
+    Entries[Index].Status = RingItems[Index].Status;
+  }
+  CopyMemory(Buffer, (uint8_t *)gBatchRing + OutputOffset, BufferSize);
+
+  return RingOk && gBatchRing->Status == STATUS_OK &&
+         gBatchRing->Faulted == 0 && gBatchRing->Completed == Count;
+}
+
+int ReadExec(uint32_t Pid, EXEC_OP *Ops, uint32_t OpCount, void *Output,
+             uint32_t OutputSize) {
+  uint64_t ItemsOffset;
+  uint64_t ItemsSize;
+  uint64_t OutputOffset;
+  uint64_t RequiredSize;
+  EXEC_OP *RingOps;
+  int RingOk;
+
+  if (Pid == 0 || Ops == NULL || OpCount == 0 || OpCount > RING_EXEC_MAX_OPS ||
+      (OutputSize != 0 && Output == NULL)) {
+    return 0;
+  }
+
+  ItemsOffset = AlignUp64(sizeof(RING_HEADER), 16ULL);
+  ItemsSize = (uint64_t)OpCount * sizeof(EXEC_OP);
+  if (ItemsSize / OpCount != sizeof(EXEC_OP)) {
+    return 0;
+  }
+  OutputOffset = AlignUp64(ItemsOffset + ItemsSize, 16ULL);
+  RequiredSize = OutputOffset + OutputSize;
+  if (RequiredSize < OutputOffset || !EnsureBatchRing(RequiredSize)) {
+    return 0;
+  }
+
+  ZeroMemory(gBatchRing, gBatchRingSize);
+  RingOps = (EXEC_OP *)((uint8_t *)gBatchRing + ItemsOffset);
+  CopyMemory(RingOps, Ops, sizeof(EXEC_OP) * OpCount);
+  for (uint32_t Index = 0; Index < OpCount; Index++) {
+    RingOps[Index].Status = 0xFFFFFFFFU;
+    Ops[Index].Status = 0xFFFFFFFFU;
+  }
+
+  gBatchRing->Magic = RING_MAGIC;
+  gBatchRing->Version = RING_VERSION;
+  gBatchRing->HeaderSize = sizeof(*gBatchRing);
+  gBatchRing->Op = RING_OP_EXEC;
+  gBatchRing->Status = 0xFFFFFFFFU;
+  gBatchRing->Sequence = GetTickCount64();
+  gBatchRing->TargetPid = Pid;
+  gBatchRing->Flags = RING_FLAG_CONTINUE_ON_ERROR;
+  gBatchRing->ItemSize = sizeof(EXEC_OP);
+  gBatchRing->ItemCount = OpCount;
+  gBatchRing->ItemsOffset = ItemsOffset;
+  gBatchRing->OutputOffset = OutputOffset;
+  gBatchRing->OutputSize = OutputSize;
+
+  RingOk = RunRing();
+
+  for (uint32_t Index = 0; Index < OpCount; Index++) {
+    Ops[Index].Status = RingOps[Index].Status;
+  }
+  if (OutputSize != 0) {
+    CopyMemory(Output, (uint8_t *)gBatchRing + OutputOffset, OutputSize);
+  }
+
+  return RingOk && gBatchRing->Status == STATUS_OK && gBatchRing->Faulted == 0;
+}
+
 int Dump(const MODULE_INFO *Module, DUMP_CALLBACK Callback, void *Context) {
   uint8_t Buffer[RESPONSE_DATA_SIZE];
   uint64_t Done = 0;
@@ -554,6 +762,8 @@ static void Usage(void) {
   printf("  Client.exe [-v] benchphys <pa> [count=1000000] [size=8]\n");
   printf("  Client.exe [-v] benchread <pid> <va> [count=1000000] [size=8]\n");
   printf("  Client.exe [-v] ringbench <pid> <va> [count=1000000] [size=8] [ring_kb=64]\n");
+  printf("  Client.exe [-v] readvbench <pid> <va> [items=256] [size=8] [iterations=1000]\n");
+  printf("  Client.exe [-v] execbench <pid> <va> [size=8] [iterations=1000]\n");
   printf("  Client.exe [-v] writephys <pa> <hex-bytes|@file>\n");
   printf("  Client.exe [-v] writevirt <pid> <va> <hex-bytes|@file>\n");
   printf("  Client.exe [-v] dump <pid> <module.dll> <out.bin>\n");
@@ -981,6 +1191,146 @@ static int RunRingBench(uint32_t TargetPid, uint64_t TargetVa, uint64_t Count,
   return FinalStatus == STATUS_OK;
 }
 
+static int RunReadvBench(uint32_t TargetPid, uint64_t TargetVa,
+                         uint32_t ItemCount, uint32_t Size,
+                         uint64_t Iterations) {
+  LARGE_INTEGER Frequency;
+  LARGE_INTEGER Start;
+  LARGE_INTEGER End;
+  READV_ENTRY *Entries;
+  uint8_t *Buffer;
+  uint32_t BufferSize;
+  uint64_t Checksum = 0;
+  double Seconds;
+  double TotalBytes;
+
+  if (ItemCount == 0 || Size == 0 || Iterations == 0 ||
+      ItemCount > 65536U || Size > RESPONSE_DATA_SIZE ||
+      ItemCount > 0xFFFFFFFFU / Size) {
+    printf("bad readvbench arguments\n");
+    return 0;
+  }
+  BufferSize = ItemCount * Size;
+  Entries = (READV_ENTRY *)malloc(sizeof(*Entries) * ItemCount);
+  Buffer = (uint8_t *)malloc(BufferSize);
+  if (Entries == NULL || Buffer == NULL) {
+    free(Entries);
+    free(Buffer);
+    return 0;
+  }
+  for (uint32_t Index = 0; Index < ItemCount; Index++) {
+    Entries[Index].Address = TargetVa + ((uint64_t)Index * Size);
+    Entries[Index].Size = Size;
+    Entries[Index].BufferOffset = Index * Size;
+    Entries[Index].Status = 0xFFFFFFFFU;
+  }
+  if (!QueryPerformanceFrequency(&Frequency)) {
+    free(Entries);
+    free(Buffer);
+    return 0;
+  }
+
+  printf("readvbench pid=%u va=0x%llx iterations=%llu items=%u size=%u total_per_iter=%u\n",
+         TargetPid, (unsigned long long)TargetVa,
+         (unsigned long long)Iterations, ItemCount, Size, BufferSize);
+
+  QueryPerformanceCounter(&Start);
+  for (uint64_t Iter = 0; Iter < Iterations; Iter++) {
+    if (!ReadVirtBatch(TargetPid, Entries, ItemCount, Buffer, BufferSize)) {
+      printf("ReadVirtBatch failed at iteration=%llu status=0x%08x completed=%llu faulted=%llu\n",
+             (unsigned long long)Iter, gBatchRing ? gBatchRing->Status : 0,
+             gBatchRing ? (unsigned long long)gBatchRing->Completed : 0,
+             gBatchRing ? (unsigned long long)gBatchRing->Faulted : 0);
+      free(Entries);
+      free(Buffer);
+      return 0;
+    }
+    Checksum += Buffer[0];
+    Checksum += ((uint64_t)Buffer[BufferSize - 1]) << 8;
+  }
+  QueryPerformanceCounter(&End);
+
+  Seconds = (double)(End.QuadPart - Start.QuadPart) /
+            (double)Frequency.QuadPart;
+  TotalBytes = (double)Iterations * (double)BufferSize;
+  printf("seconds=%.6f batches_per_sec=%.2f reads_per_sec=%.2f mib_per_sec=%.2f checksum=0x%llx last_cycles_per_read=%.2f\n",
+         Seconds, (double)Iterations / Seconds,
+         ((double)Iterations * (double)ItemCount) / Seconds,
+         (TotalBytes / (1024.0 * 1024.0)) / Seconds,
+         (unsigned long long)Checksum,
+         gBatchRing != NULL && gBatchRing->Completed != 0
+             ? (double)(gBatchRing->TscEnd - gBatchRing->TscStart) /
+                   (double)gBatchRing->Completed
+             : 0.0);
+  free(Entries);
+  free(Buffer);
+  return 1;
+}
+
+static int RunExecBench(uint32_t TargetPid, uint64_t TargetVa, uint32_t Size,
+                        uint64_t Iterations) {
+  LARGE_INTEGER Frequency;
+  LARGE_INTEGER Start;
+  LARGE_INTEGER End;
+  EXEC_OP Op;
+  uint8_t *Buffer;
+  uint64_t Checksum = 0;
+  double Seconds;
+  double TotalBytes;
+
+  if (Size == 0 || Size > RESPONSE_DATA_SIZE || Iterations == 0) {
+    printf("bad execbench arguments\n");
+    return 0;
+  }
+  Buffer = (uint8_t *)malloc(Size);
+  if (Buffer == NULL) {
+    return 0;
+  }
+  if (!QueryPerformanceFrequency(&Frequency)) {
+    free(Buffer);
+    return 0;
+  }
+
+  ZeroMemory(&Op, sizeof(Op));
+  Op.Op = EXEC_OP_READ_OUT;
+  Op.Imm = TargetVa;
+  Op.Size = Size;
+  Op.OutOffset = 0;
+
+  printf("execbench pid=%u va=0x%llx iterations=%llu size=%u\n", TargetPid,
+         (unsigned long long)TargetVa, (unsigned long long)Iterations, Size);
+
+  QueryPerformanceCounter(&Start);
+  for (uint64_t Iter = 0; Iter < Iterations; Iter++) {
+    if (!ReadExec(TargetPid, &Op, 1, Buffer, Size)) {
+      printf("ReadExec failed at iteration=%llu status=0x%08x completed=%llu faulted=%llu op_status=0x%08x\n",
+             (unsigned long long)Iter, gBatchRing ? gBatchRing->Status : 0,
+             gBatchRing ? (unsigned long long)gBatchRing->Completed : 0,
+             gBatchRing ? (unsigned long long)gBatchRing->Faulted : 0,
+             Op.Status);
+      free(Buffer);
+      return 0;
+    }
+    Checksum += Buffer[0];
+    Checksum += ((uint64_t)Buffer[Size - 1]) << 8;
+  }
+  QueryPerformanceCounter(&End);
+
+  Seconds = (double)(End.QuadPart - Start.QuadPart) /
+            (double)Frequency.QuadPart;
+  TotalBytes = (double)Iterations * (double)Size;
+  printf("seconds=%.6f execs_per_sec=%.2f mib_per_sec=%.2f checksum=0x%llx last_cycles_per_op=%.2f\n",
+         Seconds, (double)Iterations / Seconds,
+         (TotalBytes / (1024.0 * 1024.0)) / Seconds,
+         (unsigned long long)Checksum,
+         gBatchRing != NULL && gBatchRing->Completed != 0
+             ? (double)(gBatchRing->TscEnd - gBatchRing->TscStart) /
+                   (double)gBatchRing->Completed
+             : 0.0);
+  free(Buffer);
+  return 1;
+}
+
 int wmain(int argc, wchar_t **argv) {
   int Arg = 1;
   const wchar_t *Command;
@@ -1221,6 +1571,47 @@ int wmain(int argc, wchar_t **argv) {
     }
     Ok = OpenApi() && RunRingBench((uint32_t)Pid, Address, Count,
                                    (uint32_t)Size64, (uint32_t)RingKb);
+    Close();
+    return Ok ? 0 : 1;
+  }
+
+  if (_wcsicmp(Command, L"readvbench") == 0 && Arg + 2 < argc) {
+    uint64_t Pid;
+    uint64_t Address;
+    uint64_t Items = 256;
+    uint64_t Size64 = 8;
+    uint64_t Iterations = 1000;
+    if (!ParseU64(argv[Arg + 1], &Pid) || Pid > 0xFFFFFFFFULL ||
+        !ParseU64(argv[Arg + 2], &Address) ||
+        (Arg + 3 < argc && !ParseU64(argv[Arg + 3], &Items)) ||
+        (Arg + 4 < argc && !ParseU64(argv[Arg + 4], &Size64)) ||
+        (Arg + 5 < argc && !ParseU64(argv[Arg + 5], &Iterations)) ||
+        Items == 0 || Items > 65536 || Size64 == 0 ||
+        Size64 > RESPONSE_DATA_SIZE || Iterations == 0) {
+      printf("bad arguments\n");
+      return 1;
+    }
+    Ok = OpenApi() && RunReadvBench((uint32_t)Pid, Address, (uint32_t)Items,
+                                    (uint32_t)Size64, Iterations);
+    Close();
+    return Ok ? 0 : 1;
+  }
+
+  if (_wcsicmp(Command, L"execbench") == 0 && Arg + 2 < argc) {
+    uint64_t Pid;
+    uint64_t Address;
+    uint64_t Size64 = 8;
+    uint64_t Iterations = 1000;
+    if (!ParseU64(argv[Arg + 1], &Pid) || Pid > 0xFFFFFFFFULL ||
+        !ParseU64(argv[Arg + 2], &Address) ||
+        (Arg + 3 < argc && !ParseU64(argv[Arg + 3], &Size64)) ||
+        (Arg + 4 < argc && !ParseU64(argv[Arg + 4], &Iterations)) ||
+        Size64 == 0 || Size64 > RESPONSE_DATA_SIZE || Iterations == 0) {
+      printf("bad arguments\n");
+      return 1;
+    }
+    Ok = OpenApi() && RunExecBench((uint32_t)Pid, Address, (uint32_t)Size64,
+                                   Iterations);
     Close();
     return Ok ? 0 : 1;
   }

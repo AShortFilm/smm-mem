@@ -24,6 +24,7 @@ FindProcessByName("notepad.exe", &process);
 TranslateVirt(pid, va, &pa);
 
 ReadVirt(pid, va, buffer, size);
+ReadVirtBatch(pid, entries, count, buffer, buffer_size);
 WriteVirt(pid, va, buffer, size);
 
 ReadPhys(pa, buffer, size);

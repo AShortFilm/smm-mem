@@ -26,6 +26,13 @@
 #define CR0_WP (1ULL << 16)
 #define MSR_LSTAR 0xC0000082U
 #define SAVE_STATE_CR3 53U
+#define TRANSLATE_CACHE_SIZE 1024U
+
+typedef struct {
+  UINT64 Cr3;
+  UINT64 VaPage;
+  UINT64 PaPage;
+} TRANSLATE_CACHE_ENTRY;
 
 typedef struct EFI_SMM_CPU_PROTOCOL EFI_SMM_CPU_PROTOCOL;
 typedef EFI_STATUS(EFIAPI *READ_SAVE_STATE)(const EFI_SMM_CPU_PROTOCOL *This,
@@ -78,6 +85,9 @@ static UINT64 gRingPages[RING_MAX_PAGES];
 static UINT32 gRingPageCount;
 static UINT64 gRingSize;
 static UINT64 gRingSequence;
+static TRANSLATE_CACHE_ENTRY gTranslateCache[TRANSLATE_CACHE_SIZE];
+static PROCESS_INFO gRingTargetCache;
+static UINT32 gRingTargetCachePid;
 
 static VOID CopyMemLocal(VOID *Destination, const VOID *Source, UINTN Size) {
   UINT8 *Dst = (UINT8 *)Destination;
@@ -419,6 +429,37 @@ static EFI_STATUS TranslateCr3(UINT64 Cr3, UINT64 Va, UINT64 *Pa) {
   return EFI_SUCCESS;
 }
 
+static VOID ResetTranslateCache(VOID) {
+  ZeroMem(gTranslateCache, sizeof(gTranslateCache));
+}
+
+static EFI_STATUS TranslateCr3Cached(UINT64 Cr3, UINT64 Va, UINT64 *Pa) {
+  UINT64 Cr3Base;
+  UINT64 VaPage;
+  UINT64 Index;
+  TRANSLATE_CACHE_ENTRY *Entry;
+  EFI_STATUS Status;
+
+  Cr3Base = Cr3 & PhysMask();
+  VaPage = Va & PAGE_MASK;
+  Index = ((Cr3Base >> 12) ^ (VaPage >> 12) ^ (VaPage >> 21)) &
+          (TRANSLATE_CACHE_SIZE - 1U);
+  Entry = &gTranslateCache[Index];
+  if (Entry->Cr3 == Cr3Base && Entry->VaPage == VaPage &&
+      Entry->PaPage != 0) {
+    *Pa = Entry->PaPage + (Va & (PAGE_SIZE - 1ULL));
+    return EFI_SUCCESS;
+  }
+
+  Status = TranslateCr3(Cr3Base, Va, Pa);
+  if (!EFI_ERROR(Status)) {
+    Entry->Cr3 = Cr3Base;
+    Entry->VaPage = VaPage;
+    Entry->PaPage = *Pa & PAGE_MASK;
+  }
+  return Status;
+}
+
 static EFI_STATUS CopyVirtCr3(UINT64 Cr3, UINT64 Va, VOID *Buffer,
                               UINTN Size, BOOLEAN Write) {
   UINT8 *Bytes = (UINT8 *)Buffer;
@@ -430,6 +471,35 @@ static EFI_STATUS CopyVirtCr3(UINT64 Cr3, UINT64 Va, VOID *Buffer,
     }
     if (EFI_ERROR(TranslateCr3(Cr3, Va, &Pa))) {
       return EFI_NOT_FOUND;
+    }
+    if (EFI_ERROR(CopyPhys(Pa, Bytes, Chunk, Write))) {
+      return EFI_NOT_FOUND;
+    }
+    Va += Chunk;
+    Bytes += Chunk;
+    Size -= Chunk;
+  }
+  return EFI_SUCCESS;
+}
+
+static EFI_STATUS CopyVirtCr3Cached(UINT64 Cr3, UINT64 Va, VOID *Buffer,
+                                    UINTN Size, BOOLEAN Write,
+                                    UINT64 *FirstPa) {
+  UINT8 *Bytes = (UINT8 *)Buffer;
+  UINT32 First = 1;
+
+  while (Size != 0) {
+    UINT64 Pa;
+    UINTN Chunk = (UINTN)(PAGE_SIZE - (Va & (PAGE_SIZE - 1)));
+    if (Chunk > Size) {
+      Chunk = Size;
+    }
+    if (EFI_ERROR(TranslateCr3Cached(Cr3, Va, &Pa))) {
+      return EFI_NOT_FOUND;
+    }
+    if (First != 0 && FirstPa != 0) {
+      *FirstPa = Pa;
+      First = 0;
     }
     if (EFI_ERROR(CopyPhys(Pa, Bytes, Chunk, Write))) {
       return EFI_NOT_FOUND;
@@ -1197,11 +1267,495 @@ static EFI_STATUS AttachRing(UINT32 Pid, UINT64 RingVa, UINT64 RingSize) {
   return EFI_SUCCESS;
 }
 
-static EFI_STATUS RunRing(VOID) {
-  RING_HEADER Header;
+static EFI_STATUS GetRingTargetProcess(UINT32 Pid, UINT32 Flags,
+                                       PROCESS_INFO *Process) {
+  EFI_STATUS Status;
+
+  if (Pid == 0 || Process == 0) {
+    return EFI_INVALID_PARAMETER;
+  }
+  if ((Flags & RING_FLAG_REFRESH_TARGET) == 0 && gRingTargetCachePid == Pid &&
+      gRingTargetCache.Cr3 != 0) {
+    CopyMemLocal(Process, &gRingTargetCache, sizeof(*Process));
+    return EFI_SUCCESS;
+  }
+  Status = FindProcessPid(Pid, Process);
+  if (!EFI_ERROR(Status) && Process->Cr3 != 0) {
+    CopyMemLocal(&gRingTargetCache, Process, sizeof(gRingTargetCache));
+    gRingTargetCachePid = Pid;
+  }
+  return Status;
+}
+
+static EFI_STATUS CopyVirtToRing(UINT64 Cr3, UINT64 Va, UINT64 RingOffset,
+                                 UINT64 Size, UINT64 *FirstPa,
+                                 UINT64 *Checksum) {
+  UINT64 Done = 0;
+
+  while (Done < Size) {
+    UINT64 Pa = 0;
+    UINTN Chunk = (UINTN)(Size - Done);
+    EFI_STATUS Status;
+
+    if (Chunk > RESPONSE_DATA_SIZE) {
+      Chunk = RESPONSE_DATA_SIZE;
+    }
+    Status = CopyVirtCr3Cached(Cr3, Va + Done, gScratch, Chunk, 0,
+                               Done == 0 ? &Pa : 0);
+    if (EFI_ERROR(Status)) {
+      return Status;
+    }
+    if (Done == 0 && FirstPa != 0) {
+      *FirstPa = Pa;
+    }
+    Status = CopyRing(RingOffset + Done, gScratch, Chunk, 1);
+    if (EFI_ERROR(Status)) {
+      return Status;
+    }
+    if (Checksum != 0 && Chunk != 0) {
+      *Checksum += gScratch[0];
+      *Checksum += ((UINT64)gScratch[Chunk - 1]) << 8;
+    }
+    Done += Chunk;
+  }
+  return EFI_SUCCESS;
+}
+
+static EFI_STATUS RunRingBench(RING_HEADER *Header) {
   PROCESS_INFO Process;
   EFI_STATUS Status;
   UINT64 Index;
+
+  if (Header->Count == 0 || Header->Size == 0 ||
+      Header->Size > RESPONSE_DATA_SIZE) {
+    Header->Status = EFI_INVALID_PARAMETER;
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Header->Status = EFI_NOT_FOUND;
+  Header->Completed = 0;
+  Header->BytesCompleted = 0;
+  Header->Faulted = 0;
+  Header->Checksum = 0;
+  Header->TscStart = __rdtsc();
+  Status = GetRingTargetProcess(Header->TargetPid, Header->Flags, &Process);
+  if (!EFI_ERROR(Status)) {
+    ResetTranslateCache();
+    for (Index = 0; Index < Header->Count; Index++) {
+      UINT64 FirstPa = 0;
+      Status = CopyVirtCr3Cached(Process.Cr3, Header->TargetVa, gScratch,
+                                 Header->Size, 0, &FirstPa);
+      if (EFI_ERROR(Status)) {
+        Header->Faulted++;
+        break;
+      }
+      Header->Checksum += gScratch[0];
+      Header->Checksum += ((UINT64)gScratch[Header->Size - 1]) << 8;
+      Header->Completed++;
+      Header->BytesCompleted += Header->Size;
+      (void)FirstPa;
+    }
+  }
+  Header->TscEnd = __rdtsc();
+  Header->Status = (UINT32)Status;
+  return Status;
+}
+
+static EFI_STATUS RunRingReadV(RING_HEADER *Header) {
+  PROCESS_INFO Process;
+  EFI_STATUS Status;
+  EFI_STATUS FirstError = EFI_SUCCESS;
+  UINT64 ItemTableSize;
+  UINT32 Index;
+
+  if (Header->ItemCount == 0 || Header->ItemSize < sizeof(RING_READV_ITEM) ||
+      Header->ItemsOffset > gRingSize ||
+      Header->OutputOffset > gRingSize ||
+      Header->OutputSize > gRingSize - Header->OutputOffset) {
+    Header->Status = EFI_INVALID_PARAMETER;
+    return EFI_INVALID_PARAMETER;
+  }
+  ItemTableSize = (UINT64)Header->ItemCount * Header->ItemSize;
+  if (Header->ItemCount != 0 &&
+      ItemTableSize / Header->ItemCount != Header->ItemSize) {
+    Header->Status = EFI_INVALID_PARAMETER;
+    return EFI_INVALID_PARAMETER;
+  }
+  if (ItemTableSize > gRingSize - Header->ItemsOffset) {
+    Header->Status = EFI_INVALID_PARAMETER;
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Header->Status = EFI_NOT_FOUND;
+  Header->Completed = 0;
+  Header->BytesCompleted = 0;
+  Header->Faulted = 0;
+  Header->Checksum = 0;
+  Header->TscStart = __rdtsc();
+
+  Status = GetRingTargetProcess(Header->TargetPid, Header->Flags, &Process);
+  if (EFI_ERROR(Status)) {
+    Header->TscEnd = __rdtsc();
+    Header->Status = (UINT32)Status;
+    return Status;
+  }
+
+  ResetTranslateCache();
+  for (Index = 0; Index < Header->ItemCount; Index++) {
+    UINT64 ItemOffset = Header->ItemsOffset + ((UINT64)Index * Header->ItemSize);
+    RING_READV_ITEM Item;
+    UINT64 FirstPa = 0;
+
+    Status = CopyRing(ItemOffset, &Item, sizeof(Item), 0);
+    if (EFI_ERROR(Status)) {
+      FirstError = Status;
+      Header->Faulted++;
+      if ((Header->Flags & RING_FLAG_CONTINUE_ON_ERROR) == 0) {
+        break;
+      }
+      continue;
+    }
+    Item.Status = EFI_INVALID_PARAMETER;
+    Item.Pa = 0;
+    if (Item.Size == 0 || Item.OutOffset > Header->OutputSize ||
+        Item.Size > Header->OutputSize - Item.OutOffset) {
+      Status = EFI_INVALID_PARAMETER;
+    } else {
+      Status = CopyVirtToRing(Process.Cr3, Item.Va,
+                              Header->OutputOffset + Item.OutOffset,
+                              Item.Size, &FirstPa, &Header->Checksum);
+    }
+    Item.Status = (UINT32)Status;
+    Item.Pa = EFI_ERROR(Status) ? 0 : FirstPa;
+    CopyRing(ItemOffset, &Item, sizeof(Item), 1);
+
+    if (EFI_ERROR(Status)) {
+      if (FirstError == EFI_SUCCESS) {
+        FirstError = Status;
+      }
+      Header->Faulted++;
+      if ((Header->Flags & RING_FLAG_CONTINUE_ON_ERROR) == 0) {
+        break;
+      }
+    } else {
+      Header->Completed++;
+      Header->BytesCompleted += Item.Size;
+    }
+  }
+
+  Header->TscEnd = __rdtsc();
+  Header->Status = (UINT32)FirstError;
+  return FirstError;
+}
+
+static BOOLEAN ExecRegOk(UINT8 Reg) { return Reg < RING_EXEC_MAX_REGS; }
+
+static EFI_STATUS ExecAddU64(UINT64 A, UINT64 B, UINT64 *Out) {
+  UINT64 Value;
+
+  if (Out == 0) {
+    return EFI_INVALID_PARAMETER;
+  }
+  Value = A + B;
+  if (Value < A) {
+    return EFI_INVALID_PARAMETER;
+  }
+  *Out = Value;
+  return EFI_SUCCESS;
+}
+
+static EFI_STATUS ExecMulU64(UINT64 A, UINT64 B, UINT64 *Out) {
+  if (Out == 0) {
+    return EFI_INVALID_PARAMETER;
+  }
+  if (A != 0 && B > 0xFFFFFFFFFFFFFFFFULL / A) {
+    return EFI_INVALID_PARAMETER;
+  }
+  *Out = A * B;
+  return EFI_SUCCESS;
+}
+
+static EFI_STATUS ExecScalarSize(UINT32 Op, UINT32 *Size) {
+  if (Size == 0) {
+    return EFI_INVALID_PARAMETER;
+  }
+  if (Op == RING_EXEC_OP_READ_U8) {
+    *Size = 1;
+  } else if (Op == RING_EXEC_OP_READ_U16) {
+    *Size = 2;
+  } else if (Op == RING_EXEC_OP_READ_U32) {
+    *Size = 4;
+  } else if (Op == RING_EXEC_OP_READ_U64) {
+    *Size = 8;
+  } else {
+    return EFI_INVALID_PARAMETER;
+  }
+  return EFI_SUCCESS;
+}
+
+static EFI_STATUS ExecOutputBounds(const RING_HEADER *Header,
+                                   const RING_EXEC_OP *Op, UINT32 Size) {
+  if (Header == 0 || Op == 0 || Size == 0 ||
+      Op->OutOffset > Header->OutputSize ||
+      Size > Header->OutputSize - Op->OutOffset) {
+    return EFI_INVALID_PARAMETER;
+  }
+  return EFI_SUCCESS;
+}
+
+static EFI_STATUS ExecAddress(const RING_EXEC_OP *Op, const UINT64 *Regs,
+                              UINT64 *Address) {
+  if (Op == 0 || Regs == 0 || Address == 0 || !ExecRegOk(Op->Src)) {
+    return EFI_INVALID_PARAMETER;
+  }
+  if ((Op->Flags & RING_EXEC_FLAG_SKIP_IF_ZERO) != 0 && Regs[Op->Src] == 0) {
+    *Address = 0;
+    return EFI_NOT_FOUND;
+  }
+  return ExecAddU64(Regs[Op->Src], Op->Imm, Address);
+}
+
+static EFI_STATUS ExecReadScalar(UINT64 Cr3, UINT64 Address, UINT32 Size,
+                                 UINT64 *Value) {
+  UINT64 Temp = 0;
+  EFI_STATUS Status;
+
+  if (Value == 0 || (Size != 1 && Size != 2 && Size != 4 && Size != 8)) {
+    return EFI_INVALID_PARAMETER;
+  }
+  Status = CopyVirtCr3Cached(Cr3, Address, &Temp, Size, 0, 0);
+  *Value = EFI_ERROR(Status) ? 0 : Temp;
+  return Status;
+}
+
+static EFI_STATUS ExecWriteRegToRing(const RING_HEADER *Header,
+                                     const RING_EXEC_OP *Op, UINT64 Value) {
+  UINT32 Size;
+  EFI_STATUS Status;
+
+  if (Header == 0 || Op == 0) {
+    return EFI_INVALID_PARAMETER;
+  }
+  Size = Op->Size;
+  if (Size != 1 && Size != 2 && Size != 4 && Size != 8) {
+    return EFI_INVALID_PARAMETER;
+  }
+  Status = ExecOutputBounds(Header, Op, Size);
+  if (EFI_ERROR(Status)) {
+    return Status;
+  }
+  return CopyRing(Header->OutputOffset + Op->OutOffset, &Value, Size, 1);
+}
+
+static VOID ExecChecksumValue(RING_HEADER *Header, UINT64 Value, UINT32 Size) {
+  if (Header == 0 || Size == 0 || Size > 8) {
+    return;
+  }
+  Header->Checksum += (UINT8)Value;
+  Header->Checksum += ((Value >> ((Size - 1) * 8)) & 0xFFULL) << 8;
+}
+
+static EFI_STATUS RunRingExec(RING_HEADER *Header) {
+  PROCESS_INFO Process;
+  EFI_STATUS Status;
+  EFI_STATUS FirstError = EFI_SUCCESS;
+  UINT64 ItemTableSize;
+  UINT64 Regs[RING_EXEC_MAX_REGS];
+  UINT32 Index;
+
+  if (Header->ItemCount == 0 || Header->ItemCount > RING_EXEC_MAX_OPS ||
+      Header->ItemSize < sizeof(RING_EXEC_OP) ||
+      Header->ItemsOffset > gRingSize ||
+      Header->OutputOffset > gRingSize ||
+      Header->OutputSize > gRingSize - Header->OutputOffset) {
+    Header->Status = EFI_INVALID_PARAMETER;
+    return EFI_INVALID_PARAMETER;
+  }
+  ItemTableSize = (UINT64)Header->ItemCount * Header->ItemSize;
+  if (Header->ItemCount != 0 &&
+      ItemTableSize / Header->ItemCount != Header->ItemSize) {
+    Header->Status = EFI_INVALID_PARAMETER;
+    return EFI_INVALID_PARAMETER;
+  }
+  if (ItemTableSize > gRingSize - Header->ItemsOffset) {
+    Header->Status = EFI_INVALID_PARAMETER;
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Header->Status = EFI_NOT_FOUND;
+  Header->Completed = 0;
+  Header->BytesCompleted = 0;
+  Header->Faulted = 0;
+  Header->Checksum = 0;
+  Header->TscStart = __rdtsc();
+
+  Status = GetRingTargetProcess(Header->TargetPid, Header->Flags, &Process);
+  if (EFI_ERROR(Status)) {
+    Header->TscEnd = __rdtsc();
+    Header->Status = (UINT32)Status;
+    return Status;
+  }
+
+  ZeroMem(Regs, sizeof(Regs));
+  ResetTranslateCache();
+  for (Index = 0; Index < Header->ItemCount; Index++) {
+    UINT64 ItemOffset = Header->ItemsOffset + ((UINT64)Index * Header->ItemSize);
+    RING_EXEC_OP Op;
+    UINT64 Address = 0;
+    UINT64 Value = 0;
+    UINT32 Bytes = 0;
+    UINT32 Optional = 0;
+
+    Status = CopyRing(ItemOffset, &Op, sizeof(Op), 0);
+    if (EFI_ERROR(Status)) {
+      FirstError = Status;
+      Header->Faulted++;
+      if ((Header->Flags & RING_FLAG_CONTINUE_ON_ERROR) == 0) {
+        break;
+      }
+      continue;
+    }
+
+    Op.Status = EFI_SUCCESS;
+    Optional = (Op.Flags & RING_EXEC_FLAG_OPTIONAL) != 0;
+    switch (Op.Op) {
+    case RING_EXEC_OP_MOV_IMM:
+      if (!ExecRegOk(Op.Dst)) {
+        Status = EFI_INVALID_PARAMETER;
+      } else {
+        Regs[Op.Dst] = Op.Imm;
+        Status = EFI_SUCCESS;
+      }
+      break;
+    case RING_EXEC_OP_READ_U8:
+    case RING_EXEC_OP_READ_U16:
+    case RING_EXEC_OP_READ_U32:
+    case RING_EXEC_OP_READ_U64:
+      Status = ExecScalarSize(Op.Op, &Bytes);
+      if (!EFI_ERROR(Status) && !ExecRegOk(Op.Dst)) {
+        Status = EFI_INVALID_PARAMETER;
+      }
+      if (!EFI_ERROR(Status)) {
+        Status = ExecAddress(&Op, Regs, &Address);
+      }
+      if (!EFI_ERROR(Status)) {
+        Status = ExecReadScalar(Process.Cr3, Address, Bytes, &Value);
+      }
+      if (ExecRegOk(Op.Dst)) {
+        Regs[Op.Dst] = EFI_ERROR(Status) ? 0 : Value;
+      }
+      if (!EFI_ERROR(Status)) {
+        Header->BytesCompleted += Bytes;
+        ExecChecksumValue(Header, Value, Bytes);
+      }
+      break;
+    case RING_EXEC_OP_ADD:
+      if (!ExecRegOk(Op.Dst) || !ExecRegOk(Op.Src)) {
+        Status = EFI_INVALID_PARAMETER;
+      } else {
+        Status = ExecAddU64(Regs[Op.Src], Op.Imm, &Regs[Op.Dst]);
+      }
+      break;
+    case RING_EXEC_OP_AND:
+      if (!ExecRegOk(Op.Dst) || !ExecRegOk(Op.Src)) {
+        Status = EFI_INVALID_PARAMETER;
+      } else {
+        Regs[Op.Dst] = Regs[Op.Src] & Op.Imm;
+        Status = EFI_SUCCESS;
+      }
+      break;
+    case RING_EXEC_OP_SHR:
+      if (!ExecRegOk(Op.Dst) || !ExecRegOk(Op.Src) || Op.Imm >= 64) {
+        Status = EFI_INVALID_PARAMETER;
+      } else {
+        Regs[Op.Dst] = Regs[Op.Src] >> Op.Imm;
+        Status = EFI_SUCCESS;
+      }
+      break;
+    case RING_EXEC_OP_MUL:
+      if (!ExecRegOk(Op.Dst) || !ExecRegOk(Op.Src)) {
+        Status = EFI_INVALID_PARAMETER;
+      } else {
+        Status = ExecMulU64(Regs[Op.Src], Op.Imm, &Regs[Op.Dst]);
+      }
+      break;
+    case RING_EXEC_OP_OUT:
+      if (!ExecRegOk(Op.Src)) {
+        Status = EFI_INVALID_PARAMETER;
+      } else {
+        Status = ExecWriteRegToRing(Header, &Op, Regs[Op.Src]);
+        if (!EFI_ERROR(Status)) {
+          ExecChecksumValue(Header, Regs[Op.Src], Op.Size);
+        }
+      }
+      break;
+    case RING_EXEC_OP_READ_OUT:
+      Status = ExecAddress(&Op, Regs, &Address);
+      if (!EFI_ERROR(Status)) {
+        Status = ExecOutputBounds(Header, &Op, Op.Size);
+      }
+      if (!EFI_ERROR(Status)) {
+        Status = CopyVirtToRing(Process.Cr3, Address,
+                                Header->OutputOffset + Op.OutOffset, Op.Size,
+                                0, &Header->Checksum);
+      }
+      if (!EFI_ERROR(Status)) {
+        Header->BytesCompleted += Op.Size;
+      }
+      break;
+    case RING_EXEC_OP_LEA:
+      if (!ExecRegOk(Op.Dst) || !ExecRegOk(Op.Src) || !ExecRegOk(Op.Aux)) {
+        Status = EFI_INVALID_PARAMETER;
+      } else if ((Op.Flags & RING_EXEC_FLAG_SKIP_IF_ZERO) != 0 &&
+                 Regs[Op.Src] == 0) {
+        Regs[Op.Dst] = 0;
+        Status = EFI_NOT_FOUND;
+      } else {
+        UINT64 Product = 0;
+        UINT64 Sum = 0;
+        UINT64 Scale = Op.Size == 0 ? 1 : Op.Size;
+        Status = ExecMulU64(Regs[Op.Aux], Scale, &Product);
+        if (!EFI_ERROR(Status)) {
+          Status = ExecAddU64(Regs[Op.Src], Product, &Sum);
+        }
+        if (!EFI_ERROR(Status)) {
+          Status = ExecAddU64(Sum, Op.Imm, &Regs[Op.Dst]);
+        }
+      }
+      break;
+    default:
+      Status = EFI_UNSUPPORTED;
+      break;
+    }
+
+    Op.Status = (UINT32)Status;
+    CopyRing(ItemOffset, &Op, sizeof(Op), 1);
+
+    if (EFI_ERROR(Status)) {
+      if (!Optional) {
+        if (FirstError == EFI_SUCCESS) {
+          FirstError = Status;
+        }
+        Header->Faulted++;
+      }
+      if ((Op.Flags & RING_EXEC_FLAG_BREAK_ON_ERROR) != 0 ||
+          (!Optional &&
+           (Header->Flags & RING_FLAG_CONTINUE_ON_ERROR) == 0)) {
+        break;
+      }
+    } else {
+      Header->Completed++;
+    }
+  }
+
+  Header->TscEnd = __rdtsc();
+  Header->Status = (UINT32)FirstError;
+  return FirstError;
+}
+
+static EFI_STATUS RunRing(VOID) {
+  RING_HEADER Header;
+  EFI_STATUS Status;
 
   if (gRingPageCount == 0 || gRingSize < sizeof(Header)) {
     return EFI_NOT_FOUND;
@@ -1211,33 +1765,22 @@ static EFI_STATUS RunRing(VOID) {
     return Status;
   }
   if (Header.Magic != RING_MAGIC || Header.Version != RING_VERSION ||
-      Header.HeaderSize < sizeof(Header) || Header.Op != RING_OP_BENCH_READ ||
-      Header.Count == 0 || Header.Size == 0 ||
-      Header.Size > RESPONSE_DATA_SIZE) {
+      Header.HeaderSize < sizeof(Header)) {
     Header.Status = EFI_INVALID_PARAMETER;
     CopyRing(0, &Header, sizeof(Header), 1);
     return EFI_INVALID_PARAMETER;
   }
 
-  Header.Status = EFI_NOT_FOUND;
-  Header.Completed = 0;
-  Header.Checksum = 0;
-  Header.TscStart = __rdtsc();
-  Status = FindProcessPid(Header.TargetPid, &Process);
-  if (!EFI_ERROR(Status)) {
-    for (Index = 0; Index < Header.Count; Index++) {
-      Status =
-          CopyVirtCr3(Process.Cr3, Header.TargetVa, gScratch, Header.Size, 0);
-      if (EFI_ERROR(Status)) {
-        break;
-      }
-      Header.Checksum += gScratch[0];
-      Header.Checksum += ((UINT64)gScratch[Header.Size - 1]) << 8;
-      Header.Completed++;
-    }
+  if (Header.Op == RING_OP_BENCH_READ) {
+    Status = RunRingBench(&Header);
+  } else if (Header.Op == RING_OP_READV) {
+    Status = RunRingReadV(&Header);
+  } else if (Header.Op == RING_OP_EXEC) {
+    Status = RunRingExec(&Header);
+  } else {
+    Header.Status = EFI_UNSUPPORTED;
+    Status = EFI_UNSUPPORTED;
   }
-  Header.TscEnd = __rdtsc();
-  Header.Status = (UINT32)Status;
   CopyRing(0, &Header, sizeof(Header), 1);
   return Status;
 }
