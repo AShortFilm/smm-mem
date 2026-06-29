@@ -27,6 +27,9 @@
 #define MSR_LSTAR 0xC0000082U
 #define SAVE_STATE_CR3 53U
 #define TRANSLATE_CACHE_SIZE 1024U
+#define MAP_WINDOW_DEFAULT_SLOT 0U
+#define MAP_WINDOW_RING_SLOT 1U
+#define MAP_WINDOW_SLOT_COUNT 2U
 
 typedef struct {
   UINT64 Cr3;
@@ -78,8 +81,8 @@ static UINT64 gPhysMask;
 static UINT32 gMapReady;
 static UINT64 gMapWindow;
 static UINT64 gMapPdpt;
-static UINT64 gMapWindowBase;
-static UINT32 gMapWindowBaseValid;
+static UINT64 gMapWindowBase[MAP_WINDOW_SLOT_COUNT];
+static UINT32 gMapWindowBaseValid[MAP_WINDOW_SLOT_COUNT];
 static UINT8 gScratch[RESPONSE_DATA_SIZE];
 static UINT64 gRingPages[RING_MAX_PAGES];
 static UINT32 gRingPageCount;
@@ -280,8 +283,8 @@ static EFI_STATUS InitMapWindow(VOID) {
   }
   ZeroMem((VOID *)(UINTN)Memory, (UINTN)PAGE_SIZE);
   gMapPdpt = Memory;
-  gMapWindowBase = 0;
-  gMapWindowBaseValid = 0;
+  ZeroMem(gMapWindowBase, sizeof(gMapWindowBase));
+  ZeroMem(gMapWindowBaseValid, sizeof(gMapWindowBaseValid));
   gMapWindow = ((UINT64)Index) << 39;
   WritePtEntryNoWp(&Pml4[Index], (gMapPdpt & Mask) | PAGE_TABLE_FLAGS);
   __writecr3(__readcr3());
@@ -289,31 +292,34 @@ static EFI_STATUS InitMapWindow(VOID) {
   return EFI_SUCCESS;
 }
 
-static EFI_STATUS MapWindowHuge(UINT64 Address) {
+static EFI_STATUS MapWindowHugeSlot(UINT32 Slot, UINT64 Address) {
   EFI_STATUS Status;
   UINT64 Entry;
   UINT64 Base;
   UINT64 Mask;
 
+  if (Slot >= MAP_WINDOW_SLOT_COUNT) {
+    return EFI_INVALID_PARAMETER;
+  }
   Status = InitMapWindow();
   if (EFI_ERROR(Status)) {
     return Status;
   }
   Mask = PhysMask();
   Base = Address & HUGE_PAGE_MASK & Mask;
-  if (gMapWindowBaseValid != 0 && gMapWindowBase == Base) {
+  if (gMapWindowBaseValid[Slot] != 0 && gMapWindowBase[Slot] == Base) {
     return EFI_SUCCESS;
   }
   Entry = Base | PAGE_TABLE_FLAGS | PTE_LARGE;
-  WritePtEntryNoWp(&((volatile UINT64 *)(UINTN)gMapPdpt)[0], Entry);
+  WritePtEntryNoWp(&((volatile UINT64 *)(UINTN)gMapPdpt)[Slot], Entry);
   __writecr3(__readcr3());
-  gMapWindowBase = Base;
-  gMapWindowBaseValid = 1;
+  gMapWindowBase[Slot] = Base;
+  gMapWindowBaseValid[Slot] = 1;
   return EFI_SUCCESS;
 }
 
-static EFI_STATUS CopyPhysWindow(UINT64 Address, VOID *Buffer, UINTN Size,
-                                 BOOLEAN Write) {
+static EFI_STATUS CopyPhysWindowSlot(UINT32 Slot, UINT64 Address, VOID *Buffer,
+                                     UINTN Size, BOOLEAN Write) {
   volatile UINT8 *Window;
   UINT8 *Bytes;
   EFI_STATUS Status;
@@ -321,6 +327,9 @@ static EFI_STATUS CopyPhysWindow(UINT64 Address, VOID *Buffer, UINTN Size,
   UINTN Index;
   UINT64 Offset;
 
+  if (Slot >= MAP_WINDOW_SLOT_COUNT) {
+    return EFI_INVALID_PARAMETER;
+  }
   Bytes = (UINT8 *)Buffer;
   while (Size != 0) {
     Offset = Address & (HUGE_PAGE_SIZE - 1ULL);
@@ -328,11 +337,13 @@ static EFI_STATUS CopyPhysWindow(UINT64 Address, VOID *Buffer, UINTN Size,
     if (Chunk > Size) {
       Chunk = Size;
     }
-    Status = MapWindowHuge(Address);
+    Status = MapWindowHugeSlot(Slot, Address);
     if (EFI_ERROR(Status)) {
       return Status;
     }
-    Window = (volatile UINT8 *)(UINTN)(gMapWindow + Offset);
+    Window = (volatile UINT8 *)(UINTN)(gMapWindow +
+                                       ((UINT64)Slot * HUGE_PAGE_SIZE) +
+                                       Offset);
     for (Index = 0; Index < Chunk; Index++) {
       if (Write) {
         Window[Index] = Bytes[Index];
@@ -345,6 +356,12 @@ static EFI_STATUS CopyPhysWindow(UINT64 Address, VOID *Buffer, UINTN Size,
     Size -= Chunk;
   }
   return EFI_SUCCESS;
+}
+
+static EFI_STATUS CopyPhysWindow(UINT64 Address, VOID *Buffer, UINTN Size,
+                                 BOOLEAN Write) {
+  return CopyPhysWindowSlot(MAP_WINDOW_DEFAULT_SLOT, Address, Buffer, Size,
+                            Write);
 }
 
 static EFI_STATUS CopyPhys(UINT64 Address, VOID *Buffer, UINTN Size,
@@ -969,6 +986,16 @@ static EFI_STATUS FillProcessInfo(UINT64 Eprocess, PROCESS_INFO *Info) {
   return EFI_SUCCESS;
 }
 
+static BOOLEAN ProcessInfoLooksAlive(const PROCESS_INFO *Info) {
+  if (Info == 0 || Info->Pid == 0 || Info->Cr3 == 0) {
+    return 0;
+  }
+  if (Info->Pid == 4) {
+    return 1;
+  }
+  return Info->ImageBase != 0 && IsUserPtr(Info->ImageBase);
+}
+
 static EFI_STATUS FindProcessPid(UINT32 Pid, PROCESS_INFO *Info) {
   UINT64 Head;
   UINT64 Link;
@@ -1009,10 +1036,14 @@ static EFI_STATUS FindProcessName(const char *Name, PROCESS_INFO *Info) {
   char CurrentName[NAME_SIZE];
   char ImagePath[260];
   UINT64 Cr3;
+  PROCESS_INFO Fallback;
+  BOOLEAN HaveFallback;
 
   if (ResolveProcessLayout() != EFI_SUCCESS) {
     return EFI_NOT_FOUND;
   }
+  ZeroMem(&Fallback, sizeof(Fallback));
+  HaveFallback = 0;
   if (gNameOffset != 0) {
     ZeroMem(CurrentName, sizeof(CurrentName));
     CopyVirtCr3(gKernelCr3, gSystemProcess + gNameOffset, CurrentName,
@@ -1027,12 +1058,17 @@ static EFI_STATUS FindProcessName(const char *Name, PROCESS_INFO *Info) {
   }
   for (Guard = 0; Guard < 4096 && IsKernelPtr(Link) && Link != Head; Guard++) {
     UINT64 Eprocess = Link - gLinksOffset;
+    BOOLEAN NameMatch = 0;
+    BOOLEAN PathMatch = 0;
+    PROCESS_INFO Candidate;
+
+    ZeroMem(&Candidate, sizeof(Candidate));
     if (gNameOffset != 0) {
       ZeroMem(CurrentName, sizeof(CurrentName));
       CopyVirtCr3(gKernelCr3, Eprocess + gNameOffset, CurrentName,
                   sizeof(CurrentName) - 1, 0);
       if (SameName(CurrentName, Name)) {
-        return FillProcessInfo(Eprocess, Info);
+        NameMatch = 1;
       }
     }
     if (GetProcessCr3(Eprocess, &Cr3) == EFI_SUCCESS) {
@@ -1040,13 +1076,28 @@ static EFI_STATUS FindProcessName(const char *Name, PROCESS_INFO *Info) {
       if (ReadProcessImagePath(Eprocess, Cr3, ImagePath, sizeof(ImagePath)) ==
               EFI_SUCCESS &&
           SameBaseName(ImagePath, Name)) {
-        return FillProcessInfo(Eprocess, Info);
+        PathMatch = 1;
+      }
+    }
+    if ((NameMatch || PathMatch) &&
+        FillProcessInfo(Eprocess, &Candidate) == EFI_SUCCESS) {
+      if (PathMatch && ProcessInfoLooksAlive(&Candidate)) {
+        CopyMemLocal(Info, &Candidate, sizeof(*Info));
+        return EFI_SUCCESS;
+      }
+      if (!HaveFallback && ProcessInfoLooksAlive(&Candidate)) {
+        CopyMemLocal(&Fallback, &Candidate, sizeof(Fallback));
+        HaveFallback = 1;
       }
     }
     if (ReadVirt64(gKernelCr3, Eprocess + gLinksOffset, &Link) !=
         EFI_SUCCESS) {
       break;
     }
+  }
+  if (HaveFallback) {
+    CopyMemLocal(Info, &Fallback, sizeof(*Info));
+    return EFI_SUCCESS;
   }
   return EFI_NOT_FOUND;
 }
@@ -1224,7 +1275,9 @@ static EFI_STATUS CopyRing(UINT64 Offset, VOID *Buffer, UINTN Size,
     if (Chunk > Size) {
       Chunk = Size;
     }
-    Status = CopyPhys(gRingPages[PageIndex] + PageOffset, Bytes, Chunk, Write);
+    Status = CopyPhysWindowSlot(MAP_WINDOW_RING_SLOT,
+                                gRingPages[PageIndex] + PageOffset, Bytes,
+                                Chunk, Write);
     if (EFI_ERROR(Status)) {
       return Status;
     }

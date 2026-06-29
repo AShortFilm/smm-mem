@@ -571,7 +571,11 @@ static int EnsureBatchRing(uint64_t RequiredSize) {
   if (gBatchRing == NULL) {
     return 0;
   }
-  ZeroMemory(gBatchRing, RingSize);
+  /*
+   * VirtualAlloc returns zero-filled committed pages.  Do not memset the full
+   * ring here: large rings can be many MiB, and the page-touch loop below is
+   * enough to fault the pages in before VirtualLock/AttachRing.
+   */
   for (size_t Offset = 0; Offset < RingSize; Offset += 4096U) {
     ((volatile uint8_t *)gBatchRing)[Offset] = 0;
   }
@@ -611,7 +615,7 @@ int ReadVirtBatch(uint32_t Pid, READV_ENTRY *Entries, uint32_t Count,
     return 0;
   }
 
-  ZeroMemory(gBatchRing, gBatchRingSize);
+  ZeroMemory(gBatchRing, (size_t)RequiredSize);
   RingItems = (RING_READV_ITEM *)((uint8_t *)gBatchRing + ItemsOffset);
   for (uint32_t Index = 0; Index < Count; Index++) {
     if (Entries[Index].Size == 0 ||
@@ -678,7 +682,7 @@ int ReadExec(uint32_t Pid, EXEC_OP *Ops, uint32_t OpCount, void *Output,
     return 0;
   }
 
-  ZeroMemory(gBatchRing, gBatchRingSize);
+  ZeroMemory(gBatchRing, (size_t)RequiredSize);
   RingOps = (EXEC_OP *)((uint8_t *)gBatchRing + ItemsOffset);
   CopyMemory(RingOps, Ops, sizeof(EXEC_OP) * OpCount);
   for (uint32_t Index = 0; Index < OpCount; Index++) {
